@@ -15,6 +15,7 @@
     "@number-flow/react": "^0.5.14",
     "@pascal-app/core": "*",
     "@pascal-app/editor": "*",
+    "@pascal-app/ifc-converter": "*",
     "@pascal-app/mcp": "*",
     "@pascal-app/nodes": "*",
     "@pascal-app/viewer": "*",

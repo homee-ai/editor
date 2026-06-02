@@ -3,15 +3,12 @@
 // Node registry bootstrap is loaded once at the root via
 // `<ClientBootstrap>` in `app/layout.tsx` — no per-page side-effect
 // import here.
-import {
-  applySceneGraphToEditor,
-  Editor,
-  type SceneGraph,
-  type SidebarTab,
-} from '@pascal-app/editor'
+import { applySceneGraphToEditor, Editor, type SceneGraph } from '@pascal-app/editor'
+import { MessageSquare } from 'lucide-react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AiChatPanel } from './ai-chat-panel'
 import { CommunityViewerToolbarLeft, CommunityViewerToolbarRight } from './viewer-toolbar'
 
 export interface SceneMeta {
@@ -27,13 +24,7 @@ export interface SceneMeta {
   nodeCount: number
 }
 
-const SIDEBAR_TABS: (SidebarTab & { component: React.ComponentType })[] = [
-  {
-    id: 'site',
-    label: 'Scene',
-    component: () => null, // Built-in SitePanel handles this
-  },
-]
+// SIDEBAR_TABS is now generated dynamically inside SceneLoader to pass sceneId context.
 
 interface SceneLoaderProps {
   initialScene: SceneGraph
@@ -156,6 +147,24 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
     [meta.id],
   )
 
+  const sidebarTabs = useMemo(
+    () => [
+      {
+        id: 'ai',
+        label: 'Chat',
+        component: AiChatPanel,
+        mobileDefaultSnap: 0.7,
+        mobileIcon: <MessageSquare className="h-5 w-5" />,
+      },
+      {
+        id: 'site',
+        label: 'Scene',
+        component: () => null,
+      },
+    ],
+    [],
+  )
+
   return (
     <div className="relative h-screen w-screen">
       {conflict && (
@@ -201,7 +210,7 @@ export function SceneLoader({ initialScene, meta }: SceneLoaderProps) {
         onSave={handleSave}
         onThumbnailCapture={handleThumb}
         projectId={meta.projectId ?? 'default'}
-        sidebarTabs={SIDEBAR_TABS}
+        sidebarTabs={sidebarTabs}
         viewerToolbarLeft={<CommunityViewerToolbarLeft />}
         viewerToolbarRight={<CommunityViewerToolbarRight />}
       />

@@ -567,7 +567,9 @@ const PostProcessingPasses = ({
       console.error('[viewer/post-processing] Render pass failed.', {
         retryCount: retryCountRef.current,
         rendererCtor: (renderer as any).constructor?.name,
-        error,
+        error: error instanceof Error ? error : String(error),
+        errorMessage: (error as any)?.message,
+        errorName: (error as any)?.constructor?.name,
       })
       if (renderPipelineRef.current) {
         renderPipelineRef.current.dispose()

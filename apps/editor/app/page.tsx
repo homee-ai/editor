@@ -1,14 +1,22 @@
 'use client'
 
 import { Editor, ItemsPanel } from '@pascal-app/editor'
-import { Layers, Package, Settings } from 'lucide-react'
+import { Layers, MessageSquare, Package, Settings } from 'lucide-react'
 import Link from 'next/link'
+import { AiChatPanel } from '@/components/ai-chat-panel'
 import {
   CommunityViewerToolbarLeft,
   CommunityViewerToolbarRight,
 } from '@/components/viewer-toolbar'
 
 const SIDEBAR_TABS = [
+  {
+    id: 'ai',
+    label: 'Chat',
+    component: AiChatPanel,
+    mobileDefaultSnap: 0.7,
+    mobileIcon: <MessageSquare className="h-5 w-5" />,
+  },
   {
     id: 'site',
     label: 'Scene',
