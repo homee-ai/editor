@@ -17,7 +17,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import { ViewerOverlay } from '../../components/viewer-overlay'
+import { CompassRose, ViewerOverlay } from '../../components/viewer-overlay'
 import { ViewerZoneSystem } from '../../components/viewer-zone-system'
 import { type PresetsAdapter, PresetsProvider } from '../../contexts/presets-context'
 import { type SaveStatus, useAutoSave } from '../../hooks/use-auto-save'
@@ -878,6 +878,11 @@ const ViewerCanvas = memo(function ViewerCanvas({
         >
           <div className="h-full w-full overflow-hidden">
             <FloorplanPanel />
+          </div>
+          <div className="dark pointer-events-none absolute top-16 right-4 z-30 text-foreground">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full border border-border/40 bg-background/90 shadow-lg backdrop-blur-md">
+              <CompassRose />
+            </div>
           </div>
           {viewMode === 'split' && (
             <div

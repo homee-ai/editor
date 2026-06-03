@@ -59,6 +59,7 @@ type UpdateNodeAction = {
     scale?: [number, number, number]
     width?: number
     height?: number
+    thickness?: number
     color?: string
     start?: [number, number]
     end?: [number, number]
@@ -893,7 +894,7 @@ function buildSceneContext() {
     .map((id) => nodeMap[id])
     .filter(Boolean)
     .slice(0, 20)
-    .map((node) => summarizeNode(node, nodeMap))
+    .map((node) => (node?.type === 'wall' ? summarizeWall(node) : summarizeNode(node, nodeMap)))
   const counts = Object.values(nodes).reduce<Record<string, number>>((acc, node) => {
     if (!node?.type) return acc
     acc[node.type] = (acc[node.type] ?? 0) + 1
@@ -943,6 +944,23 @@ function summarizeNode(node: any, nodes: Record<string, any>) {
 }
 
 function summarizeWall(wall: any) {
+  const start = Array.isArray(wall.start) ? wall.start : [0, 0]
+  const end = Array.isArray(wall.end) ? wall.end : [0, 0]
+  const dx = Number(end[0]) - Number(start[0])
+  const dz = Number(end[1]) - Number(start[1])
+  const absDx = Math.abs(dx)
+  const absDz = Math.abs(dz)
+  // 2D floorplan rotates the scene by FLOORPLAN_VIEW_ROTATION_DEG (90°).
+  // Result: scene +X = compass South, scene -X = North; scene +Z = West, -Z = East.
+  // So a wall varying in Z runs east-west in compass space; varying in X runs north-south.
+  let orientation: 'east-west' | 'north-south' | 'diagonal'
+  if (absDz >= absDx * 4) orientation = 'east-west'
+  else if (absDx >= absDz * 4) orientation = 'north-south'
+  else orientation = 'diagonal'
+  // +Z = West, so the endpoint with the LARGER z is the west endpoint.
+  const westEndpoint = start[1] >= end[1] ? 'start' : 'end'
+  // +X = South, so the endpoint with the LARGER x is the south endpoint.
+  const southEndpoint = start[0] >= end[0] ? 'start' : 'end'
   return {
     id: wall.id,
     type: wall.type,
@@ -951,6 +969,13 @@ function summarizeWall(wall: any) {
     start: wall.start,
     end: wall.end,
     length: getWallLength(wall),
+    thickness: wall.thickness,
+    height: wall.height,
+    orientation,
+    westEndpoint,
+    eastEndpoint: westEndpoint === 'start' ? 'end' : 'start',
+    southEndpoint,
+    northEndpoint: southEndpoint === 'start' ? 'end' : 'start',
   }
 }
 
@@ -1127,6 +1152,9 @@ function sanitizeNodePatch(
   }
   if (typeof patch.height === 'number' && ['wall', 'door', 'window'].includes(node.type)) {
     next.height = clamp(patch.height, 0.1, 12)
+  }
+  if (typeof patch.thickness === 'number' && node.type === 'wall') {
+    next.thickness = clamp(patch.thickness, 0.02, 2)
   }
   if (patch.position && ['item', 'door', 'window'].includes(node.type)) {
     next.position =

@@ -1,6 +1,7 @@
 'use client'
 
 import { Icon } from '@iconify/react'
+import useEditor from '../store/use-editor'
 import {
   type AnyNode,
   type AnyNodeId,
@@ -46,6 +47,113 @@ type ProjectOwner = {
   name: string
   username: string | null
   image: string | null
+}
+
+export function CompassOverlay() {
+  const viewMode = useEditor((s) => s.viewMode)
+  if (viewMode !== '2d' && viewMode !== 'split') return null
+  return (
+    <div className="dark pointer-events-none absolute right-4 bottom-24 z-20 text-foreground">
+      <div className="flex h-16 w-16 items-center justify-center rounded-full border border-border/30 bg-background/80 shadow-sm backdrop-blur-md">
+        <CompassRose />
+      </div>
+    </div>
+  )
+}
+
+export function CompassRose() {
+  return (
+    <svg
+      aria-label="Compass: N=up, S=down, E=right, W=left"
+      fill="none"
+      height={64}
+      role="img"
+      viewBox="0 0 64 64"
+      width={64}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      {/* Outer ring */}
+      <circle cx={32} cy={32} r={28} stroke="currentColor" strokeOpacity={0.15} strokeWidth={1} />
+      {/* Cardinal tick marks */}
+      {[0, 90, 180, 270].map((deg) => {
+        const rad = (deg * Math.PI) / 180
+        const x1 = 32 + Math.sin(rad) * 22
+        const y1 = 32 - Math.cos(rad) * 22
+        const x2 = 32 + Math.sin(rad) * 28
+        const y2 = 32 - Math.cos(rad) * 28
+        return (
+          <line
+            key={deg}
+            stroke="currentColor"
+            strokeOpacity={0.4}
+            strokeWidth={1}
+            x1={x1}
+            x2={x2}
+            y1={y1}
+            y2={y2}
+          />
+        )
+      })}
+      {/* North arrow — red */}
+      <polygon fill="#ef4444" points="32,6 29,32 32,28 35,32" />
+      {/* South arrow — muted */}
+      <polygon fill="currentColor" fillOpacity={0.3} points="32,58 35,32 32,36 29,32" />
+      {/* East arrow — muted */}
+      <polygon fill="currentColor" fillOpacity={0.3} points="58,32 32,29 36,32 32,35" />
+      {/* West arrow — muted */}
+      <polygon fill="currentColor" fillOpacity={0.3} points="6,32 32,35 28,32 32,29" />
+      {/* Center dot */}
+      <circle cx={32} cy={32} fill="currentColor" fillOpacity={0.5} r={2} />
+      {/* Labels */}
+      <text
+        dominantBaseline="auto"
+        fill="#ef4444"
+        fontSize={9}
+        fontWeight="700"
+        textAnchor="middle"
+        x={32}
+        y={5}
+      >
+        N
+      </text>
+      <text
+        dominantBaseline="hanging"
+        fill="currentColor"
+        fillOpacity={0.5}
+        fontSize={8}
+        fontWeight="600"
+        textAnchor="middle"
+        x={32}
+        y={60}
+      >
+        S
+      </text>
+      <text
+        dominantBaseline="middle"
+        fill="currentColor"
+        fillOpacity={0.5}
+        fontSize={8}
+        fontWeight="600"
+        textAnchor="start"
+        x={58}
+        y={32}
+      >
+        E
+      </text>
+      <text
+        dominantBaseline="middle"
+        fill="currentColor"
+        fillOpacity={0.5}
+        fontSize={8}
+        fontWeight="600"
+        textAnchor="end"
+        x={6}
+        y={32}
+      >
+        W
+      </text>
+    </svg>
+  )
 }
 
 const levelModeLabels: Record<'stacked' | 'exploded' | 'solo', string> = {
