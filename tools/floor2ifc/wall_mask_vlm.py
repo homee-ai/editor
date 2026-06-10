@@ -53,12 +53,61 @@ def has_colored_fill(element: dict[str, Any]) -> bool:
     return fill not in {"default", "black", "none"}
 
 
+def effective_stroke_width(element: dict[str, Any]) -> float:
+    style = element.get("style", {})
+    raw = parse_float(style.get("stroke-width"), 0)
+    return float(element.get("effective_stroke_width") or raw)
+
+
+def viewbox_numbers(inventory: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    value = inventory.get("viewBox")
+    if not value:
+        return None
+    numbers = [float(item) for item in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", str(value))]
+    if len(numbers) != 4:
+        return None
+    return numbers[0], numbers[1], numbers[2], numbers[3]
+
+
+def is_small_arrow_like(element: dict[str, Any]) -> bool:
+    if element["tag"] != "polygon" or not is_default_black(element):
+        return False
+    area = float(element.get("area") or 0)
+    width = float(element.get("width") or 0)
+    height = float(element.get("height") or 0)
+    aspect = float(element.get("aspect_ratio") or 0)
+    return 80 <= area <= 700 and max(width, height) <= 45 and 1.2 <= aspect <= 4.0
+
+
+def is_page_border_candidate(element: dict[str, Any], viewbox: tuple[float, float, float, float] | None) -> bool:
+    if viewbox is None:
+        return False
+    _x, _y, view_width, view_height = viewbox
+    bbox = element.get("bbox", {})
+    width = float(element.get("width") or 0)
+    height = float(element.get("height") or 0)
+    area_ratio = (width * height) / max(view_width * view_height, 1e-6)
+    near_full_width = width >= view_width * 0.88
+    near_full_height = height >= view_height * 0.88
+    min_x = float(bbox.get("min_x", 0))
+    min_y = float(bbox.get("min_y", 0))
+    max_x = float(bbox.get("max_x", 0))
+    max_y = float(bbox.get("max_y", 0))
+    touches_canvas = (
+        min_x <= view_width * 0.03
+        or min_y <= view_height * 0.03
+        or max_x >= view_width * 0.97
+        or max_y >= view_height * 0.97
+    )
+    return area_ratio >= 0.75 and near_full_width and near_full_height and touches_canvas
+
+
 def is_wallish_candidate(element: dict[str, Any]) -> bool:
     tag = element["tag"]
     style = element.get("style", {})
     fill = color_token(style.get("fill"), "default")
     stroke = color_token(style.get("stroke"), "none")
-    stroke_width = parse_float(style.get("stroke-width"), 0)
+    stroke_width = effective_stroke_width(element)
     area = float(element.get("area") or 0)
     length = float(element.get("length_estimate") or 0)
     aspect = float(element.get("aspect_ratio") or 0)
@@ -69,6 +118,8 @@ def is_wallish_candidate(element: dict[str, Any]) -> bool:
     if area < 16 or length < 8:
         return False
     if tag in {"circle", "ellipse"}:
+        return False
+    if is_small_arrow_like(element):
         return False
     if is_default_black(element) and area >= 180:
         return True
@@ -86,7 +137,12 @@ def is_wallish_candidate(element: dict[str, Any]) -> bool:
 
 
 def select_candidates(inventory: dict[str, Any], max_candidates: int) -> list[dict[str, Any]]:
-    elements = [item for item in inventory["elements"] if is_wallish_candidate(item)]
+    viewbox = viewbox_numbers(inventory)
+    elements = [
+        item
+        for item in inventory["elements"]
+        if is_wallish_candidate(item) and not is_page_border_candidate(item, viewbox)
+    ]
 
     def score(element: dict[str, Any]) -> tuple[float, float, float]:
         style = element.get("style", {})
@@ -157,8 +213,19 @@ def geometry_bucket(element: dict[str, Any], depth: int) -> str:
             shape = "block"
         return f"{candidate_group_id(element)}__shape_{shape}"
     if depth == 3:
-        return f"{candidate_group_id(element)}__class_{norm(classes) or 'none'}"
+        sw = effective_stroke_width(element)
+        if sw >= 18:
+            stroke_bucket = "heavy"
+        elif sw >= 4:
+            stroke_bucket = "medium"
+        elif sw > 0:
+            stroke_bucket = "thin"
+        else:
+            stroke_bucket = "none"
+        return f"{candidate_group_id(element)}__stroke_{stroke_bucket}"
     if depth == 4:
+        return f"{candidate_group_id(element)}__class_{norm(classes) or 'none'}"
+    if depth == 5:
         fill = color_token(style.get("fill"), "default")
         stroke = color_token(style.get("stroke"), "none")
         return f"{candidate_group_id(element)}__paint_{fill}_{stroke}"
@@ -226,6 +293,7 @@ def split_group(group: dict[str, Any], max_group_size: int, max_depth: int) -> l
                     "group_id": group_id,
                     "base_group_id": group["base_group_id"],
                     "parent_group_id": group["group_id"],
+                    "confirming_all_wall_parent": group.get("confirming_all_wall_parent"),
                     "split_key": bucket_id,
                     "depth": split_depth,
                     "candidate_count": len(chunk),
@@ -234,6 +302,22 @@ def split_group(group: dict[str, Any], max_group_size: int, max_depth: int) -> l
                 }
             )
     return split_groups
+
+
+def split_for_all_wall_confirmation(
+    group: dict[str, Any],
+    max_group_size: int,
+    max_depth: int,
+    min_size: int,
+) -> list[dict[str, Any]]:
+    if group.get("confirming_all_wall_parent"):
+        return []
+    if len(group["candidates"]) <= min_size:
+        return []
+    children = split_group(group, max_group_size, max_depth)
+    for child in children:
+        child["confirming_all_wall_parent"] = group["group_id"]
+    return children
 
 
 def candidate_summary(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -249,6 +333,7 @@ def candidate_summary(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "fill": style.get("fill", ""),
                 "stroke": style.get("stroke", ""),
                 "sw": style.get("stroke-width", ""),
+                "sw_eff": item.get("effective_stroke_width", 0),
                 "bbox": [
                     round(float(bbox.get("min_x", 0)), 1),
                     round(float(bbox.get("min_y", 0)), 1),
@@ -260,6 +345,22 @@ def candidate_summary(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def should_split_none_wall(group: dict[str, Any], max_group_size: int, max_depth: int, max_terminal_none_size: int) -> bool:
+    if int(group.get("depth", 0)) >= max_depth or len(group["candidates"]) <= 1:
+        return False
+    if len(group["candidates"]) <= max_terminal_none_size:
+        return False
+    for item in group["candidates"]:
+        area = float(item.get("area") or 0)
+        aspect = float(item.get("aspect_ratio") or 0)
+        thickness = min(float(item.get("width") or 0), float(item.get("height") or 0))
+        if area >= 1200 and (aspect >= 2.5 or thickness <= 35):
+            return True
+        if effective_stroke_width(item) >= 8 and float(item.get("length_estimate") or 0) >= 40:
+            return True
+    return len(group["candidates"]) > max(1, max_group_size // 3)
 
 
 def compact_style_summary(inventory: dict[str, Any], limit: int = 24) -> list[dict[str, Any]]:
@@ -285,7 +386,9 @@ You will see TWO images:
 Task:
 - Compare image 1 and image 2.
 - Decide whether ALL magenta mask shapes are structural walls, NO magenta mask shapes are structural walls, or the group is MIXED.
-- Structural walls include exterior perimeter walls, interior partition walls, and wall outlines.
+- Structural walls include exterior perimeter walls, interior partition walls, wall outlines, and room-dividing boundaries between rooms.
+- Treat room partitions, room separation lines, and room boundary shapes as walls when they visually represent a physical divider, regardless of whether they are drawn as polygons, paths, lines, strokes, or fills.
+- Room color fills or area fills are not walls by themselves, but the boundary or divider shape separating rooms can be a wall.
 - Do not select furniture, fixtures, room fills, labels, dimension arrows, doors, windows, stairs, page borders, logos, or decorative details.
 - Do not worry about walls that are not shown in this candidate mask; other groups will handle them.
 
@@ -317,27 +420,47 @@ def svg_close_insert(svg_text: str, insertion: str) -> str:
     return svg_text.replace("</svg>", insertion + "\n</svg>", 1)
 
 
-def candidate_overlay_element(elem: ET.Element) -> str:
+def style_value(elem: ET.Element, item: dict[str, Any] | None, key: str, missing: str = "") -> str:
+    if item is not None:
+        value = item.get("style", {}).get(key)
+        if value is not None:
+            return str(value)
+    return str(elem.attrib.get(key, missing) or missing)
+
+
+def is_stroke_only(elem: ET.Element, item: dict[str, Any] | None) -> bool:
+    if local_name(elem.tag) in {"line", "polyline"}:
+        return True
+    fill = color_token(style_value(elem, item, "fill"), "default")
+    stroke = color_token(style_value(elem, item, "stroke"), "none")
+    return local_name(elem.tag) == "path" and fill == "none" and stroke != "none"
+
+
+def copy_resolved_stroke_width(clone: ET.Element, item: dict[str, Any] | None) -> None:
+    if parse_float(clone.attrib.get("stroke-width"), 0) > 0:
+        return
+    if item is None:
+        return
+    stroke_width = item.get("style", {}).get("stroke-width")
+    if stroke_width:
+        clone.attrib["stroke-width"] = str(stroke_width)
+
+
+def candidate_overlay_element(elem: ET.Element, item: dict[str, Any] | None = None) -> str:
     clone = deepcopy(elem)
-    tag = local_name(clone.tag)
     clone.attrib.pop("class", None)
-    if tag in {"line", "polyline"}:
+    if is_stroke_only(elem, item):
         clone.attrib["fill"] = "none"
         clone.attrib["stroke"] = "#ff2d55"
         clone.attrib["stroke-opacity"] = "0.95"
-        clone.attrib["stroke-width"] = mask_stroke_width(clone, fallback=5)
-    elif tag == "path" and norm(clone.attrib.get("fill")) in {"", "none"} and clone.attrib.get("stroke"):
-        clone.attrib["fill"] = "none"
-        clone.attrib["stroke"] = "#ff2d55"
-        clone.attrib["stroke-opacity"] = "0.95"
-        clone.attrib["stroke-width"] = mask_stroke_width(clone, fallback=5)
+        copy_resolved_stroke_width(clone, item)
+        ensure_stroke_width(clone, fallback=5)
     else:
         clone.attrib["fill"] = "#ff2d55"
         clone.attrib["fill-opacity"] = "0.42"
         clone.attrib["stroke"] = "#ff2d55"
         clone.attrib["stroke-opacity"] = "0.95"
-        clone.attrib["stroke-width"] = "2"
-    clone.attrib["vector-effect"] = "non-scaling-stroke"
+        ensure_stroke_width(clone, fallback=2)
     text = ET.tostring(clone, encoding="unicode")
     return re.sub(r"\sxmlns=\"[^\"]+\"", "", text, count=1)
 
@@ -353,7 +476,7 @@ def render_candidate_overlay(source_svg: Path, candidates: list[dict[str, Any]],
         if elem is None:
             continue
         cx, cy = item["center"]
-        parts.append(candidate_overlay_element(elem))
+        parts.append(candidate_overlay_element(elem, item))
         parts.append(
             f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="13" fill="#ff2d55" opacity="0.95"/>'
             f'<text x="{cx + 16:.3f}" y="{cy - 12:.3f}" fill="#ff2d55" '
@@ -376,7 +499,7 @@ def render_group_mask(source_svg: Path, group: dict[str, Any], out_svg: Path, sh
         elem = by_id.get(item["id"])
         if elem is None:
             continue
-        parts.append(candidate_overlay_element(elem))
+        parts.append(candidate_overlay_element(elem, item))
         if show_ids:
             cx, cy = item["center"]
             parts.append(
@@ -404,25 +527,22 @@ def index_source_elements(svg_path: Path) -> tuple[ET.Element, dict[str, ET.Elem
     return root, by_id
 
 
-def mask_stroke_width(elem: ET.Element, fallback: float = 8) -> str:
-    width = max(parse_float(elem.attrib.get("stroke-width"), 0), fallback)
-    return f"{width:g}"
+def ensure_stroke_width(elem: ET.Element, fallback: float = 8) -> None:
+    if parse_float(elem.attrib.get("stroke-width"), 0) <= 0:
+        elem.attrib["stroke-width"] = f"{fallback:g}"
 
 
-def mask_element(elem: ET.Element) -> str:
+def mask_element(elem: ET.Element, item: dict[str, Any] | None = None) -> str:
     clone = deepcopy(elem)
-    tag = local_name(clone.tag)
     clone.attrib.pop("class", None)
     clone.attrib["fill"] = "#000"
     clone.attrib["fill-opacity"] = "1"
     clone.attrib["stroke"] = "#000"
     clone.attrib["stroke-opacity"] = "1"
-    if tag in {"line", "polyline"}:
+    if is_stroke_only(elem, item):
         clone.attrib["fill"] = "none"
-        clone.attrib["stroke-width"] = mask_stroke_width(clone)
-    elif tag == "path" and norm(clone.attrib.get("fill")) in {"", "none"}:
-        clone.attrib["fill"] = "none"
-        clone.attrib["stroke-width"] = mask_stroke_width(clone)
+        copy_resolved_stroke_width(clone, item)
+        ensure_stroke_width(clone)
     else:
         clone.attrib["stroke-width"] = "0"
     text = ET.tostring(clone, encoding="unicode")
@@ -432,10 +552,12 @@ def mask_element(elem: ET.Element) -> str:
 def render_mask_svgs(
     source_svg: Path,
     selected_ids: list[str],
+    candidates: list[dict[str, Any]],
     overlay_svg: Path,
     mask_svg: Path,
 ) -> None:
     root, by_id = index_source_elements(source_svg)
+    candidate_by_id = {item["id"]: item for item in candidates}
     view_box = root.attrib.get("viewBox", "0 0 1000 1000")
     mask_parts = [
         f'<svg xmlns="{SVG_NS}" viewBox="{escape(view_box)}">',
@@ -446,7 +568,7 @@ def render_mask_svgs(
         elem = by_id.get(item_id)
         if elem is None:
             continue
-        part = mask_element(elem)
+        part = mask_element(elem, candidate_by_id.get(item_id))
         mask_parts.append(part)
         overlay_parts.append(part.replace('fill="#000"', 'fill="#ff2d55"').replace('stroke="#000"', 'stroke="#ff2d55"'))
     mask_parts.extend(["</g>", "</svg>"])
@@ -492,7 +614,7 @@ def selector_matches(selector: dict[str, Any], element: dict[str, Any]) -> bool:
         return False
     width_range = parse_selector_width_range(selector)
     if width_range:
-        stroke_width = parse_float(style.get("stroke-width"), 0)
+        stroke_width = effective_stroke_width(element)
         if not (width_range[0] <= stroke_width <= width_range[1]):
             return False
     return True
@@ -642,8 +764,28 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
         selected_ids: list[str] = []
         split_group_ids: list[str] = []
         if verdict == "all_wall":
-            selected_ids = list(group["candidate_ids"])
-            selected_id_set.update(selected_ids)
+            children = split_for_all_wall_confirmation(
+                group,
+                args.max_group_size,
+                args.max_split_depth,
+                args.confirm_all_wall_size,
+            )
+            if children:
+                queue.extend(children)
+                split_group_ids = [child["group_id"] for child in children]
+            else:
+                selected_ids = list(group["candidate_ids"])
+                selected_id_set.update(selected_ids)
+        elif verdict == "none_wall" and should_split_none_wall(
+            group,
+            args.max_group_size,
+            args.max_split_depth,
+            args.max_terminal_none_size,
+        ):
+            children = split_group(group, args.max_group_size, args.max_split_depth)
+            if children:
+                queue.extend(children)
+                split_group_ids = [child["group_id"] for child in children]
         elif verdict == "mixed":
             children = split_group(group, args.max_group_size, args.max_split_depth)
             if children:
@@ -659,6 +801,7 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
                 "group_id": group["group_id"],
                 "base_group_id": group["base_group_id"],
                 "parent_group_id": group.get("parent_group_id"),
+                "confirming_all_wall_parent": group.get("confirming_all_wall_parent"),
                 "split_key": group.get("split_key"),
                 "depth": group["depth"],
                 "candidate_count": group["candidate_count"],
@@ -686,7 +829,7 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
             "groups": group_reviews,
         },
     )
-    render_mask_svgs(svg_path, selected_ids, overlay_path, mask_path)
+    render_mask_svgs(svg_path, selected_ids, candidates, overlay_path, mask_path)
 
     manifest = {
         "source_svg": str(svg_path),
@@ -718,6 +861,18 @@ def main() -> int:
     parser.add_argument("--max-candidates", type=int, default=220)
     parser.add_argument("--max-group-size", type=int, default=45)
     parser.add_argument("--max-split-depth", type=int, default=5)
+    parser.add_argument(
+        "--max-terminal-none-size",
+        type=int,
+        default=12,
+        help="Split none_wall groups larger than this before discarding them.",
+    )
+    parser.add_argument(
+        "--confirm-all-wall-size",
+        type=int,
+        default=12,
+        help="Split all_wall groups larger than this once and require child groups to be all_wall before accepting.",
+    )
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--show-ids", action="store_true", help="Draw candidate ids on group masks for debugging.")
     parser.add_argument("--accept-single-mixed", action="store_true", help="Treat a single-candidate mixed leaf as wall.")

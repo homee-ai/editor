@@ -204,7 +204,103 @@ def bounds_from_points(points: list[tuple[float, float]]) -> Bounds | None:
     return Bounds(min(xs), min(ys), max(xs), max(ys))
 
 
+Matrix = tuple[float, float, float, float, float, float]
+IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+
+def multiply_matrix(left: Matrix, right: Matrix) -> Matrix:
+    a1, b1, c1, d1, e1, f1 = left
+    a2, b2, c2, d2, e2, f2 = right
+    return (
+        a1 * a2 + c1 * b2,
+        b1 * a2 + d1 * b2,
+        a1 * c2 + c1 * d2,
+        b1 * c2 + d1 * d2,
+        a1 * e2 + c1 * f2 + e1,
+        b1 * e2 + d1 * f2 + f1,
+    )
+
+
+def parse_transform(transform: str | None) -> Matrix:
+    if not transform:
+        return IDENTITY
+
+    matrix = IDENTITY
+    for name, raw_values in re.findall(r"([A-Za-z]+)\(([^)]*)\)", transform):
+        values = [float(item) for item in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw_values)]
+        op = name.strip().lower()
+        current = IDENTITY
+        if op == "matrix" and len(values) >= 6:
+            current = tuple(values[:6])  # type: ignore[assignment]
+        elif op == "translate" and values:
+            current = (1.0, 0.0, 0.0, 1.0, values[0], values[1] if len(values) > 1 else 0.0)
+        elif op == "scale" and values:
+            sx = values[0]
+            sy = values[1] if len(values) > 1 else sx
+            current = (sx, 0.0, 0.0, sy, 0.0, 0.0)
+        elif op == "rotate" and values:
+            angle = math.radians(values[0])
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            rotation = (cos_a, sin_a, -sin_a, cos_a, 0.0, 0.0)
+            if len(values) >= 3:
+                cx, cy = values[1], values[2]
+                current = multiply_matrix(
+                    multiply_matrix((1.0, 0.0, 0.0, 1.0, cx, cy), rotation),
+                    (1.0, 0.0, 0.0, 1.0, -cx, -cy),
+                )
+            else:
+                current = rotation
+        matrix = multiply_matrix(matrix, current)
+    return matrix
+
+
+def matrix_scale(matrix: Matrix) -> float:
+    a, b, c, d, _e, _f = matrix
+    sx = math.hypot(a, b)
+    sy = math.hypot(c, d)
+    non_zero = [item for item in (sx, sy) if item > 1e-9]
+    return sum(non_zero) / len(non_zero) if non_zero else 1.0
+
+
+def apply_matrix(point: tuple[float, float], matrix: Matrix) -> tuple[float, float]:
+    a, b, c, d, e, f = matrix
+    x, y = point
+    return (a * x + c * y + e, b * x + d * y + f)
+
+
+def transform_points(points: list[tuple[float, float]], transform: str | None) -> list[tuple[float, float]]:
+    matrix = parse_transform(transform)
+    if matrix == IDENTITY:
+        return points
+    return [apply_matrix(point, matrix) for point in points]
+
+
 def element_bounds(elem: ET.Element) -> Bounds | None:
+    bounds = raw_element_bounds(elem)
+    if bounds is None:
+        return None
+    tag = local_name(elem.tag)
+    if tag == "rect":
+        points = [
+            (bounds.min_x, bounds.min_y),
+            (bounds.max_x, bounds.min_y),
+            (bounds.max_x, bounds.max_y),
+            (bounds.min_x, bounds.max_y),
+        ]
+    elif tag in {"circle", "ellipse"}:
+        points = [
+            (bounds.min_x, bounds.min_y),
+            (bounds.max_x, bounds.min_y),
+            (bounds.max_x, bounds.max_y),
+            (bounds.min_x, bounds.max_y),
+        ]
+    else:
+        points = raw_points_for(elem, bounds)
+    return bounds_from_points(transform_points(points, elem.attrib.get("transform")))
+
+
+def raw_element_bounds(elem: ET.Element) -> Bounds | None:
     tag = local_name(elem.tag)
     if tag == "rect":
         x = parse_float(elem.attrib.get("x"))
@@ -243,6 +339,10 @@ def estimate_length(tag: str, bounds: Bounds, points: list[tuple[float, float]])
 
 
 def points_for(elem: ET.Element, bounds: Bounds) -> list[tuple[float, float]]:
+    return transform_points(raw_points_for(elem, bounds), elem.attrib.get("transform"))
+
+
+def raw_points_for(elem: ET.Element, bounds: Bounds) -> list[tuple[float, float]]:
     tag = local_name(elem.tag)
     if tag in {"polygon", "polyline"}:
         return parse_points(elem.attrib.get("points"))
@@ -252,11 +352,15 @@ def points_for(elem: ET.Element, bounds: Bounds) -> list[tuple[float, float]]:
             (parse_float(elem.attrib.get("x2")), parse_float(elem.attrib.get("y2"))),
         ]
     if tag == "rect":
+        x = parse_float(elem.attrib.get("x"))
+        y = parse_float(elem.attrib.get("y"))
+        width = parse_float(elem.attrib.get("width"))
+        height = parse_float(elem.attrib.get("height"))
         return [
-            (bounds.min_x, bounds.min_y),
-            (bounds.max_x, bounds.min_y),
-            (bounds.max_x, bounds.max_y),
-            (bounds.min_x, bounds.max_y),
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
         ]
     if tag == "path":
         return rough_path_points(elem.attrib.get("d"))
@@ -284,6 +388,8 @@ def build_inventory(svg_path: Path) -> dict[str, Any]:
         stroke_width = style.get("stroke-width", "") or "(none)"
         points = points_for(elem, bounds)
         length = estimate_length(tag, bounds, points)
+        transform_scale = matrix_scale(parse_transform(elem.attrib.get("transform")))
+        effective_stroke_width = parse_float(style.get("stroke-width"), 0) * transform_scale
         thickness = min(bounds.width, bounds.height)
         aspect_ratio = max(bounds.width, bounds.height) / max(thickness, 1e-6)
 
@@ -309,6 +415,8 @@ def build_inventory(svg_path: Path) -> dict[str, Any]:
                 "length_estimate": round(length, 3),
                 "aspect_ratio": round(aspect_ratio, 3),
                 "transform": elem.attrib.get("transform"),
+                "transform_scale": round(transform_scale, 6),
+                "effective_stroke_width": round(effective_stroke_width, 3),
             }
         )
 
