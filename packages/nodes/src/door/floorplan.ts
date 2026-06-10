@@ -206,6 +206,27 @@ export function buildDoorFloorplan(node: DoorNode, ctx: GeometryContext): Floorp
       affordance: 'resize-width',
       payload: { side: 'end' },
     })
+
+    const name = node.name?.trim()
+    if (name) {
+      // Offset opposite to the swing so the label doesn't sit inside
+      // the swept arc.
+      const offset = halfDepth + 0.6
+      children.push({
+        kind: 'text',
+        x: cx - perpX * swingSign * offset,
+        y: cz - perpZ * swingSign * offset,
+        text: name,
+        fontSize: 0.3,
+        fill: '#1f2937',
+        stroke: '#ffffff',
+        strokeWidth: 0.08,
+        paintOrder: 'stroke',
+        textAnchor: 'middle',
+        dominantBaseline: 'middle',
+        fontWeight: 600,
+      })
+    }
   }
 
   // Placement-measurement dimensions — distances to adjacent openings

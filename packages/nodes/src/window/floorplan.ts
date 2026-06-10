@@ -159,6 +159,25 @@ export function buildWindowFloorplan(
       affordance: 'resize-width',
       payload: { side: 'end' },
     })
+
+    const name = node.name?.trim()
+    if (name) {
+      const offset = halfDepth + 0.6
+      children.push({
+        kind: 'text',
+        x: cx + perpX * offset,
+        y: cz + perpZ * offset,
+        text: name,
+        fontSize: 0.3,
+        fill: '#1f2937',
+        stroke: '#ffffff',
+        strokeWidth: 0.08,
+        paintOrder: 'stroke',
+        textAnchor: 'middle',
+        dominantBaseline: 'middle',
+        fontWeight: 600,
+      })
+    }
   }
 
   // Placement-measurement dimensions when actively moving — same

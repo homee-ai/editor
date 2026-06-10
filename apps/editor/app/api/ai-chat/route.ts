@@ -9,6 +9,7 @@ export const runtime = 'nodejs'
 
 const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/openai'
 const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash'
+const REASONING_EFFORT_VALUES = new Set(['minimal', 'low', 'medium', 'high'])
 
 const chatMessageSchema = z.object({
   role: z.enum(['system', 'user', 'assistant']),
@@ -220,6 +221,7 @@ export async function POST(request: Request) {
   }
 
   const messages = withSystemPrompt(parsed.data.messages, parsed.data.sceneContext)
+  const reasoningEffort = getReasoningEffort()
   const latestUserMessage = [...parsed.data.messages]
     .reverse()
     .find((message) => message.role === 'user')?.content
@@ -234,6 +236,7 @@ export async function POST(request: Request) {
       body: JSON.stringify({
         model,
         messages,
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
         temperature: Number(getLocalEnv('EDITOR_LLM_TEMPERATURE') ?? 0.2),
         max_tokens: Math.max(Number(getLocalEnv('EDITOR_LLM_MAX_TOKENS') ?? 4096), 4096),
         stream: false,
@@ -522,6 +525,12 @@ function resolveApiKey(raw: string): string {
   }
 
   return value
+}
+
+function getReasoningEffort(): string | undefined {
+  const value = getLocalEnv('EDITOR_LLM_REASONING_EFFORT')?.trim().toLowerCase()
+  if (!value) return undefined
+  return REASONING_EFFORT_VALUES.has(value) ? value : undefined
 }
 
 function expandPath(value: string): string {

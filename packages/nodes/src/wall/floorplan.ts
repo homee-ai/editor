@@ -235,6 +235,44 @@ export function buildWallFloorplan(node: WallNode, ctx: GeometryContext): Floorp
         })
       }
     }
+
+    const name = node.name?.trim()
+    if (name) {
+      const dx = node.end[0] - node.start[0]
+      const dz = node.end[1] - node.start[1]
+      const chord = Math.hypot(dx, dz)
+      let labelX = (node.start[0] + node.end[0]) / 2
+      let labelZ = (node.start[1] + node.end[1]) / 2
+      // Offset toward building interior so the name sits opposite the
+      // dimension chrome (outside). Use the displayed wall thickness so
+      // thick foundation walls don't end up with the label jammed
+      // against / inside the wall body.
+      if (!isCurvedWall(node) && chord > 1e-6) {
+        const nx = -dz / chord
+        const nz = dx / chord
+        const wallSiblings = ctx.siblings.filter((s): s is AnyNode & WallNode => s.type === 'wall')
+        const centroid = wallCentroid([node, ...wallSiblings])
+        const facingAway =
+          (labelX - centroid[0]) * nx + (labelZ - centroid[1]) * nz >= 0 ? 1 : -1
+        const clearance = floorplanWallThickness(node) / 2 + 0.5
+        labelX -= nx * facingAway * clearance
+        labelZ -= nz * facingAway * clearance
+      }
+      children.push({
+        kind: 'text',
+        x: labelX,
+        y: labelZ,
+        text: name,
+        fontSize: 0.3,
+        fill: '#1f2937',
+        stroke: '#ffffff',
+        strokeWidth: 0.08,
+        paintOrder: 'stroke',
+        textAnchor: 'middle',
+        dominantBaseline: 'middle',
+        fontWeight: 600,
+      })
+    }
   }
 
   return { kind: 'group', children }
