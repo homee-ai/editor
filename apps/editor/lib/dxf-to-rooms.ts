@@ -388,7 +388,7 @@ function parseMetadataComments(dxfText: string): DxfRoom[] | null {
   const raws: MetaRoom[] = []
   for (const m of dxfText.matchAll(pattern)) {
     const areaM2 = parseFloat(m[2]!)
-    if (!isFinite(areaM2) || areaM2 < 1) continue // skip zero-area and noise
+    if (!Number.isFinite(areaM2) || areaM2 < 1) continue // skip zero-area and noise
     raws.push({ name: m[1]!.trim(), areaM2, location: m[3]?.trim() ?? '' })
   }
 
@@ -556,6 +556,18 @@ function parsePolygonPoints(pointsStr: string): [number, number][] {
   return pts
 }
 
+function parseSvgViewBox(svgText: string): [number, number, number, number] | null {
+  const match = svgText.match(/\bviewBox="([^"]+)"/i)
+  if (!match) return null
+  const nums = match[1]!.match(/[-+]?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? []
+  return nums.length === 4 ? [nums[0]!, nums[1]!, nums[2]!, nums[3]!] : null
+}
+
+function parseSvgNumberAttr(attrs: string, name: string): number | null {
+  const match = attrs.match(new RegExp(`\\b${name}="([-+]?\\d*\\.?\\d+(?:e[-+]?\\d+)?)"`, 'i'))
+  return match ? Number.parseFloat(match[1]!) : null
+}
+
 // ─── SVG wall extraction (C-lite: extract all walls, no room reconstruction) ─
 //
 // The Matterport FCL SVG doesn't expose a clean wall graph — walls are scattered
@@ -573,6 +585,13 @@ function parsePolygonPoints(pointsStr: string): [number, number][] {
 //   - midlines of thin rect walls (any wall-shaped rectangle)
 
 type Seg = [[number, number], [number, number]]
+type AxisSeg = { axis: 'h' | 'v'; perp: number; lo: number; hi: number }
+
+const WALL_MASK_ID = 'floor2ifc-wall-mask'
+const WALL_MASK_FALLBACK_SCALE = 0.009
+const WALL_MASK_PAIR_DISTANCE_PX = 40
+const WALL_MASK_MIN_SEGMENT_PX = 8
+const WALL_MASK_UNPAIRED_MIN_SEGMENT_PX = 18
 
 /** Parse SVG path 'd' attribute into a list of straight-line segments.
  *  Handles M/L/H/V/Z (absolute + relative). Curve commands (C/S/Q/T/A)
@@ -815,6 +834,217 @@ function classifyAxis(
     return { axis: 'v', perp, lo, hi }
   }
   return null
+}
+
+function axisToSeg(axis: AxisSeg): Seg {
+  return axis.axis === 'h'
+    ? [
+        [axis.lo, axis.perp],
+        [axis.hi, axis.perp],
+      ]
+    : [
+        [axis.perp, axis.lo],
+        [axis.perp, axis.hi],
+      ]
+}
+
+function extractSvgTagAttrs(svgText: string, tagName: string): string[] {
+  const pattern = new RegExp(`<(?:[\\w-]+:)?${tagName}\\b([^>]*)\\/?>`, 'gi')
+  return Array.from(svgText.matchAll(pattern), (match) => match[1] ?? '')
+}
+
+function extractWallMaskSvgBody(svgText: string): string | null {
+  const groupStart = svgText.search(
+    new RegExp(`<(?:[\\w-]+:)?g\\b[^>]*\\bid="${WALL_MASK_ID}"[^>]*>`, 'i'),
+  )
+  if (groupStart < 0) return null
+  const openEnd = svgText.indexOf('>', groupStart)
+  if (openEnd < 0) return null
+  const closeStart = svgText.indexOf('</g>', openEnd)
+  return closeStart < 0 ? null : svgText.slice(openEnd + 1, closeStart)
+}
+
+function rectCenterline(attrs: string): Seg | null {
+  const x = parseSvgNumberAttr(attrs, 'x') ?? 0
+  const y = parseSvgNumberAttr(attrs, 'y') ?? 0
+  const width = parseSvgNumberAttr(attrs, 'width')
+  const height = parseSvgNumberAttr(attrs, 'height')
+  if (width === null || height === null || width <= 0 || height <= 0) return null
+  if (width >= height) {
+    return [
+      [x, y + height / 2],
+      [x + width, y + height / 2],
+    ]
+  }
+  return [
+    [x + width / 2, y],
+    [x + width / 2, y + height],
+  ]
+}
+
+function polygonEdges(points: [number, number][]): Seg[] {
+  const edges: Seg[] = []
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i]
+    const b = points[(i + 1) % points.length]
+    if (a && b && Math.hypot(b[0] - a[0], b[1] - a[1]) >= WALL_MASK_MIN_SEGMENT_PX) {
+      edges.push([a, b])
+    }
+  }
+  return edges
+}
+
+function centerlinesFromBoundarySegments(segments: Seg[]): Seg[] {
+  const axes = segments
+    .map((seg) => classifyAxis(seg, 3))
+    .filter((seg): seg is AxisSeg => Boolean(seg))
+    .filter((seg) => seg.hi - seg.lo >= WALL_MASK_MIN_SEGMENT_PX)
+
+  const used = new Set<number>()
+  const centerlines: AxisSeg[] = []
+
+  for (let i = 0; i < axes.length; i++) {
+    if (used.has(i)) continue
+    const a = axes[i]!
+    let bestIndex = -1
+    let bestOverlap = 0
+
+    for (let j = i + 1; j < axes.length; j++) {
+      if (used.has(j)) continue
+      const b = axes[j]!
+      if (a.axis !== b.axis) continue
+      const distance = Math.abs(a.perp - b.perp)
+      if (distance <= 0.5 || distance > WALL_MASK_PAIR_DISTANCE_PX) continue
+      const overlap = Math.min(a.hi, b.hi) - Math.max(a.lo, b.lo)
+      const shorter = Math.min(a.hi - a.lo, b.hi - b.lo)
+      if (overlap < Math.max(WALL_MASK_MIN_SEGMENT_PX, shorter * 0.45)) continue
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap
+        bestIndex = j
+      }
+    }
+
+    if (bestIndex >= 0) {
+      const b = axes[bestIndex]!
+      used.add(i)
+      used.add(bestIndex)
+      centerlines.push({
+        axis: a.axis,
+        perp: (a.perp + b.perp) / 2,
+        lo: Math.max(a.lo, b.lo),
+        hi: Math.min(a.hi, b.hi),
+      })
+    }
+  }
+
+  for (let i = 0; i < axes.length; i++) {
+    if (used.has(i)) continue
+    const axis = axes[i]!
+    if (axis.hi - axis.lo >= WALL_MASK_UNPAIRED_MIN_SEGMENT_PX) {
+      centerlines.push(axis)
+    }
+  }
+
+  return centerlines.map(axisToSeg)
+}
+
+function collectWallMaskSegments(maskBody: string): Seg[] {
+  const directCenterlines: Seg[] = []
+  const boundarySegments: Seg[] = []
+
+  for (const attrs of extractSvgTagAttrs(maskBody, 'rect')) {
+    const centerline = rectCenterline(attrs)
+    if (centerline) directCenterlines.push(centerline)
+  }
+
+  for (const attrs of extractSvgTagAttrs(maskBody, 'line')) {
+    const x1 = parseSvgNumberAttr(attrs, 'x1')
+    const y1 = parseSvgNumberAttr(attrs, 'y1')
+    const x2 = parseSvgNumberAttr(attrs, 'x2')
+    const y2 = parseSvgNumberAttr(attrs, 'y2')
+    if (x1 !== null && y1 !== null && x2 !== null && y2 !== null) {
+      directCenterlines.push([
+        [x1, y1],
+        [x2, y2],
+      ])
+    }
+  }
+
+  for (const attrs of extractSvgTagAttrs(maskBody, 'polygon')) {
+    const pointsMatch = attrs.match(/\bpoints="([^"]+)"/i)
+    if (!pointsMatch) continue
+    const points = parsePolygonPoints(pointsMatch[1]!)
+    const centerline = extractWallMidline(points)
+    if (centerline) directCenterlines.push(centerline)
+    boundarySegments.push(...polygonEdges(points))
+  }
+
+  for (const attrs of extractSvgTagAttrs(maskBody, 'path')) {
+    const pathMatch = attrs.match(/\bd="([^"]+)"/i)
+    if (!pathMatch) continue
+    boundarySegments.push(...parsePathSegments(pathMatch[1]!))
+  }
+
+  return dedupeSegments([...directCenterlines, ...centerlinesFromBoundarySegments(boundarySegments)], 4)
+}
+
+function dedupeSegments(segments: Seg[], eps: number): Seg[] {
+  const result: Seg[] = []
+  for (const seg of segments) {
+    if (Math.hypot(seg[1][0] - seg[0][0], seg[1][1] - seg[0][1]) < WALL_MASK_MIN_SEGMENT_PX) {
+      continue
+    }
+    if (!result.some((existing) => segsAreDuplicate(existing, seg, eps))) {
+      result.push(seg)
+    }
+  }
+  return result
+}
+
+export function isWallMaskSvg(svgText: string): boolean {
+  return new RegExp(`\\bid="${WALL_MASK_ID}"`, 'i').test(svgText)
+}
+
+export function parseWallMaskSvgToRooms(svgText: string): DxfParseResult {
+  const maskBody = extractWallMaskSvgBody(svgText)
+  if (!maskBody) {
+    return { ok: false, message: `SVG 中找不到 ${WALL_MASK_ID} 群組。` }
+  }
+
+  const segments = collectWallMaskSegments(maskBody)
+  if (segments.length === 0) {
+    return { ok: false, message: 'wall mask SVG 中沒有可轉換的牆線段。' }
+  }
+
+  const viewBox = parseSvgViewBox(svgText)
+  const fallbackOriginX = viewBox ? viewBox[0] + viewBox[2] / 2 : 0
+  const fallbackOriginY = viewBox ? viewBox[1] + viewBox[3] / 2 : 0
+  const allPoints = segments.flat()
+  const originX =
+    allPoints.reduce((sum, point) => sum + point[0], 0) / Math.max(1, allPoints.length) ||
+    fallbackOriginX
+  const originY =
+    allPoints.reduce((sum, point) => sum + point[1], 0) / Math.max(1, allPoints.length) ||
+    fallbackOriginY
+
+  const toScene = (svgX: number, svgY: number): [number, number] => [
+    Math.round((svgX - originX) * WALL_MASK_FALLBACK_SCALE * 1000) / 1000,
+    Math.round((svgY - originY) * WALL_MASK_FALLBACK_SCALE * 1000) / 1000,
+  ]
+
+  return {
+    ok: true,
+    rooms: segments.map((segment, index) => ({
+      name: `Structural Wall ${index + 1}`,
+      width: 1,
+      depth: 1,
+      centerX: 0,
+      centerZ: 0,
+      color: '#9ca3af',
+      polygon: [toScene(segment[0][0], segment[0][1]), toScene(segment[1][0], segment[1][1])],
+      outlineOnly: true,
+    })),
+  }
 }
 
 /** Group collinear axis-aligned wall segments and merge each group into the
@@ -1244,7 +1474,7 @@ export function parseSvgToRooms(svgText: string): DxfParseResult {
     const d = m[1]!
     // Require an actual arc command (A/a) with separator context so we don't
     // match the letter "a" inside attribute names or numbers.
-    if (!/(?:^|[\s,0-9.\-])[Aa](?:[\s,0-9.\-]|$)/.test(d)) continue
+    if (!/(?:^|[\s,0-9.-])[Aa](?:[\s,0-9.-]|$)/.test(d)) continue
     const segs = parsePathSegments(d)
     if (segs.length === 0) continue
     let pminX = Infinity,

@@ -4,10 +4,15 @@ import { DoorNode, useScene, WindowNode } from '@pascal-app/core'
 import { applySceneGraphToEditor, CATALOG_ITEMS } from '@pascal-app/editor'
 import { convertIfcToPascal } from '@pascal-app/ifc-converter'
 import { useViewer } from '@pascal-app/viewer'
-import { AlertCircle, Loader2, Paperclip, Plus, Send, Sparkles } from 'lucide-react'
+import { AlertCircle, Loader2, Paperclip, Send, Sparkles } from 'lucide-react'
 import type { FormEvent } from 'react'
 import { useEffect, useRef, useState } from 'react'
-import { parseDxfToRooms, parseSvgToRooms } from '@/lib/dxf-to-rooms'
+import {
+  isWallMaskSvg,
+  parseDxfToRooms,
+  parseSvgToRooms,
+  parseWallMaskSvgToRooms,
+} from '@/lib/dxf-to-rooms'
 import { cn } from '@/lib/utils'
 
 type ChatRole = 'user' | 'assistant'
@@ -161,6 +166,9 @@ const SUGGESTIONS = [
   'Build a bathroom',
 ]
 
+const DEFAULT_IMPORTED_WALL_HEIGHT = 3.1
+const DEFAULT_IMPORTED_WALL_THICKNESS = 0.1
+
 function createMessage(role: ChatRole, content: string): ChatMessage {
   return {
     id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -255,7 +263,12 @@ export function AiChatPanel() {
       trimmed.startsWith('<svg') ||
       trimmed.startsWith('<SVG') ||
       (trimmed.startsWith('<?xml') && trimmed.includes('<svg'))
-    const result = isSvg ? parseSvgToRooms(rawText) : parseDxfToRooms(rawText)
+    const isWallMask = isSvg && isWallMaskSvg(rawText)
+    const result = isWallMask
+      ? parseWallMaskSvgToRooms(rawText)
+      : isSvg
+        ? parseSvgToRooms(rawText)
+        : parseDxfToRooms(rawText)
     if (!result.ok) {
       setError(`解析失敗：${result.message}`)
       return false
@@ -294,9 +307,11 @@ export function AiChatPanel() {
     if (wallSegments.length > 0) extras.push(`${wallSegments.length} 道牆`)
     if (totalWindows > 0) extras.push(`${totalWindows} 扇窗`)
     if (totalDoors > 0) extras.push(`${totalDoors} 扇門`)
-    const summary = summaryLines.length > 0
-      ? `偵測到 ${labeledRooms.length} 個有實際形狀的房間：\n${summaryLines.join('\n')}\n• 含 ${extras.join('、')}`
-      : `從 SVG 抽出 ${extras.join('、')}`
+    const summary = isWallMask
+      ? `從 wall mask SVG 抽出 ${wallSegments.length} 道結構牆（預設牆高 ${DEFAULT_IMPORTED_WALL_HEIGHT.toFixed(1)}m）`
+      : summaryLines.length > 0
+        ? `偵測到 ${labeledRooms.length} 個有實際形狀的房間：\n${summaryLines.join('\n')}\n• 含 ${extras.join('、')}`
+        : `從 SVG 抽出 ${extras.join('、')}`
     setMessages((current) => [
       ...current,
       createMessage('user', label),
@@ -707,8 +722,8 @@ function buildSceneWithActions(actions: SceneAction[]) {
           children: [],
           start,
           end,
-          thickness: 0.1,
-          height: 2.8,
+          thickness: DEFAULT_IMPORTED_WALL_THICKNESS,
+          height: DEFAULT_IMPORTED_WALL_HEIGHT,
           frontSide: 'unknown',
           backSide: 'unknown',
         }

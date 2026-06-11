@@ -379,12 +379,13 @@ def build_group_prompt(inventory: dict[str, Any], group: dict[str, Any]) -> str:
     }
     return f"""You are judging whether one candidate mask group is pure wall in a floor-plan SVG.
 
-You will see TWO images:
+You will see THREE images:
 1. Original clean floor-plan image.
-2. Candidate mask image for exactly one candidate group. Magenta shapes are the candidates in this group. There may be no visible ids.
+2. Isolated candidate mask image for exactly one candidate group on a white background.
+3. The same candidate group overlaid on the original floor-plan with candidate ids.
 
 Task:
-- Compare image 1 and image 2.
+- Compare all three images, using image 3 for spatial context.
 - Decide whether ALL magenta mask shapes are structural walls, NO magenta mask shapes are structural walls, or the group is MIXED.
 - Structural walls include exterior perimeter walls, interior partition walls, wall outlines, and room-dividing boundaries between rooms.
 - Treat room partitions, room separation lines, and room boundary shapes as walls when they visually represent a physical divider, regardless of whether they are drawn as polygons, paths, lines, strokes, or fills.
@@ -400,14 +401,18 @@ JSON shape:
 {{
   "group_id": "{group['group_id']}",
   "verdict": "all_wall|none_wall|mixed",
+  "wall_ids": [],
+  "non_wall_ids": [],
   "reason": "short visual reason",
   "confidence": 0.0
 }}
 
 Verdict rules:
-- all_wall: every visible magenta mask shape in image 2 is wall.
-- none_wall: no visible magenta mask shape in image 2 is wall.
+- all_wall: every visible magenta mask shape is wall.
+- none_wall: no visible magenta mask shape is wall.
 - mixed: some magenta shapes are wall and some are not, or you cannot decide for the whole group.
+- For mixed, fill wall_ids with visible candidate ids that are walls and non_wall_ids with visible candidate ids that are not walls.
+- Use only ids shown in image 3 and listed in the candidate summary.
 
 Group/candidate summary:
 {json.dumps(summary, ensure_ascii=False, separators=(",", ":"))[:12000]}
@@ -510,6 +515,28 @@ def render_group_mask(source_svg: Path, group: dict[str, Any], out_svg: Path, sh
             )
     parts.extend(["</g>", "</svg>"])
     out_svg.write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+
+def render_group_overlay(source_svg: Path, group: dict[str, Any], out_svg: Path) -> None:
+    original = source_svg.read_text(encoding="utf-8", errors="ignore")
+    _root, by_id = index_source_elements(source_svg)
+    parts = [
+        f'\n<g id="{OVERLAY_GROUP_ID}" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700">',
+    ]
+    for item in group["candidates"]:
+        elem = by_id.get(item["id"])
+        if elem is None:
+            continue
+        cx, cy = item["center"]
+        parts.append(candidate_overlay_element(elem, item))
+        parts.append(
+            f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="13" fill="#ff2d55" opacity="0.95"/>'
+            f'<text x="{cx + 16:.3f}" y="{cy - 12:.3f}" fill="#ff2d55" '
+            'paint-order="stroke" stroke="white" stroke-width="5" vector-effect="non-scaling-stroke">'
+            f'{escape(item["id"])}</text>'
+        )
+    parts.append("</g>")
+    out_svg.write_text(svg_close_insert(original, "\n".join(parts)), encoding="utf-8")
 
 
 def index_source_elements(svg_path: Path) -> tuple[ET.Element, dict[str, ET.Element]]:
@@ -643,6 +670,24 @@ def selected_ids_from_review(
     return sorted(selected)
 
 
+def review_candidate_ids(review: dict[str, Any], key: str, group: dict[str, Any]) -> set[str]:
+    allowed = set(group["candidate_ids"])
+    return {
+        item
+        for item in review.get(key, [])
+        if isinstance(item, str) and item in allowed
+    }
+
+
+def group_with_candidates(group: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        **group,
+        "candidate_count": len(candidates),
+        "candidate_ids": [item["id"] for item in candidates],
+        "candidates": candidates,
+    }
+
+
 def parse_vlm_json(raw: str, raw_path: Path) -> dict[str, Any]:
     try:
         return extract_json_object(raw)
@@ -655,13 +700,14 @@ def parse_vlm_json(raw: str, raw_path: Path) -> dict[str, Any]:
 
 
 def repair_vlm_json(client: VlmClient, raw: str, dump_request: bool, max_tokens: int) -> str:
-    prompt = f"""Convert the following model response into ONLY one valid minified JSON object with keys group_id, verdict, reason, confidence.
+    prompt = f"""Convert the following model response into ONLY one valid minified JSON object with keys group_id, verdict, wall_ids, non_wall_ids, reason, confidence.
 
 Rules:
 - No markdown.
 - No explanation.
 - verdict must be one of all_wall, none_wall, mixed.
-- If the response is incomplete or unusable, return {{"group_id":"","verdict":"mixed","reason":"unusable_partial_response","confidence":0}}.
+- wall_ids and non_wall_ids must be arrays.
+- If the response is incomplete or unusable, return {{"group_id":"","verdict":"mixed","wall_ids":[],"non_wall_ids":[],"reason":"unusable_partial_response","confidence":0}}.
 
 Response:
 {raw[:12000]}
@@ -723,12 +769,14 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
         group_dir = groups_dir / group["group_id"]
         group_dir.mkdir(parents=True, exist_ok=True)
         group_mask_path = group_dir / "candidate_mask.svg"
+        group_overlay_path = group_dir / "candidate_overlay.svg"
         group_prompt_path = group_dir / "wall_label_prompt.txt"
         group_raw_path = group_dir / "vlm_raw.txt"
         group_review_path = group_dir / "vlm_wall_labels.json"
         group_prompt = build_group_prompt(inventory, group)
 
         render_group_mask(svg_path, group, group_mask_path, args.show_ids)
+        render_group_overlay(svg_path, group, group_overlay_path)
         group_prompt_path.write_text(group_prompt, encoding="utf-8")
 
         review: dict[str, Any] = {
@@ -743,7 +791,7 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
         elif not args.prepare_only and client is not None:
             raw = client.chat_with_svgs(
                 group_prompt,
-                [svg_path, group_mask_path],
+                [svg_path, group_mask_path, group_overlay_path],
                 image_size=args.image_size,
                 dump_request=args.dump_request,
                 max_tokens=args.max_output_tokens,
@@ -787,13 +835,26 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
                 queue.extend(children)
                 split_group_ids = [child["group_id"] for child in children]
         elif verdict == "mixed":
-            children = split_group(group, args.max_group_size, args.max_split_depth)
+            explicit_wall_ids = review_candidate_ids(review, "wall_ids", group)
+            explicit_non_wall_ids = review_candidate_ids(review, "non_wall_ids", group)
+            if explicit_wall_ids:
+                selected_ids = sorted(explicit_wall_ids)
+                selected_id_set.update(selected_ids)
+
+            remaining_candidates = [
+                item
+                for item in group["candidates"]
+                if item["id"] not in explicit_wall_ids and item["id"] not in explicit_non_wall_ids
+            ]
+            split_source = group_with_candidates(group, remaining_candidates) if remaining_candidates else group
+            children = split_group(split_source, args.max_group_size, args.max_split_depth) if remaining_candidates else []
             if children:
                 queue.extend(children)
                 split_group_ids = [child["group_id"] for child in children]
-            elif args.accept_single_mixed and len(group["candidate_ids"]) == 1:
-                selected_ids = list(group["candidate_ids"])
-                selected_id_set.update(selected_ids)
+            elif args.accept_single_mixed and len(remaining_candidates) == 1:
+                fallback_ids = [remaining_candidates[0]["id"]]
+                selected_ids = sorted(set(selected_ids) | set(fallback_ids))
+                selected_id_set.update(fallback_ids)
 
         write_json(group_review_path, review)
         group_reviews.append(
@@ -808,8 +869,11 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
                 "verdict": verdict,
                 "selected_wall_count": len(selected_ids),
                 "selected_wall_ids": selected_ids,
+                "review_wall_ids": sorted(review_candidate_ids(review, "wall_ids", group)),
+                "review_non_wall_ids": sorted(review_candidate_ids(review, "non_wall_ids", group)),
                 "split_group_ids": split_group_ids,
                 "candidate_mask": str(group_mask_path),
+                "candidate_overlay": str(group_overlay_path),
                 "prompt": str(group_prompt_path),
                 "vlm_raw": str(group_raw_path) if group_raw_path.exists() else None,
                 "vlm_wall_labels": str(group_review_path),
