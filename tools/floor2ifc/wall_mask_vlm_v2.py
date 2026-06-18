@@ -242,8 +242,11 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
             if children:
                 queue.extend(children)
                 split_group_ids = [child["group_id"] for child in children]
-            elif args.accept_single_mixed and len(remaining_candidates) == 1:
-                fallback_ids = [remaining_candidates[0]["id"]]
+            elif remaining_candidates:
+                # Mixed contract: every candidate must be wall or non_wall. Anything the
+                # VLM left unclassified that we can no longer subdivide is kept as wall
+                # rather than silently dropped into neither bucket.
+                fallback_ids = [item["id"] for item in remaining_candidates]
                 selected_ids = sorted(set(selected_ids) | set(fallback_ids))
                 selected_id_set.update(fallback_ids)
 
@@ -341,7 +344,6 @@ def main() -> int:
     parser.add_argument("--confirm-all-wall-size", type=int, default=12)
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--show-ids", action="store_true")
-    parser.add_argument("--accept-single-mixed", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--mock-response", type=Path, default=None)
     parser.add_argument("--dump-request", action="store_true")

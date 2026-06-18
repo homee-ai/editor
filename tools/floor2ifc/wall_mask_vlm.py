@@ -401,10 +401,12 @@ You will see THREE images:
 Task:
 - Compare all three images, using image 3 for spatial context.
 - Decide whether ALL magenta mask shapes are structural walls, NO magenta mask shapes are structural walls, or the group is MIXED.
-- Structural walls include exterior perimeter walls, interior partition walls, wall outlines, and room-dividing boundaries between rooms.
+- Structural walls include exterior perimeter walls, interior partition walls, wall outlines, room-dividing boundaries between rooms, windows set into a wall, and the wall line at a door opening.
 - Treat room partitions, room separation lines, and room boundary shapes as walls when they visually represent a physical divider, regardless of whether they are drawn as polygons, paths, lines, strokes, or fills.
 - Room color fills or area fills are not walls by themselves, but the boundary or divider shape separating rooms can be a wall.
-- Do not select furniture, fixtures, room fills, labels, dimension arrows, doors, windows, stairs, page borders, logos, or decorative details.
+- Windows count as wall: window glass/sill lines drawn inside a wall opening are part of the wall (they keep the wall continuous). Select them.
+- A door opening is part of the wall: the wall line spanning a door opening counts as wall. BUT the door swing arc (the curved quarter-circle) and the door leaf/panel are NOT walls — do not select those.
+- Do not select furniture, fixtures, room fills, labels, dimension arrows, door swing arcs, door leaves/panels, stairs, page borders, logos, or decorative details.
 - Do not worry about walls that are not shown in this candidate mask; other groups will handle them.
 
 Output rules:
@@ -424,8 +426,9 @@ JSON shape:
 Verdict rules:
 - all_wall: every visible magenta mask shape is wall.
 - none_wall: no visible magenta mask shape is wall.
-- mixed: some magenta shapes are wall and some are not, or you cannot decide for the whole group.
-- For mixed, fill wall_ids with visible candidate ids that are walls and non_wall_ids with visible candidate ids that are not walls.
+- mixed: some magenta shapes are wall and some are not.
+- For mixed, EVERY candidate id in the summary MUST appear in exactly one of wall_ids or non_wall_ids. Together wall_ids and non_wall_ids must cover all candidate ids. Never leave an id out of both.
+- If a single candidate shape is mostly a structural wall with only minor non-wall pixels attached (e.g. a wall with a bit of hatching, a fixture outline, or a stair line fused onto it), classify that id as a wall (put it in wall_ids), do not call it mixed-and-drop it.
 - Use only ids shown in image 3 and listed in the candidate summary.
 
 Group/candidate summary:
@@ -865,8 +868,11 @@ def run(svg_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, An
             if children:
                 queue.extend(children)
                 split_group_ids = [child["group_id"] for child in children]
-            elif args.accept_single_mixed and len(remaining_candidates) == 1:
-                fallback_ids = [remaining_candidates[0]["id"]]
+            elif remaining_candidates:
+                # Mixed contract: every candidate must be wall or non_wall. Anything the
+                # VLM left unclassified that we can no longer subdivide is kept as wall
+                # rather than silently dropped into neither bucket.
+                fallback_ids = [item["id"] for item in remaining_candidates]
                 selected_ids = sorted(set(selected_ids) | set(fallback_ids))
                 selected_id_set.update(fallback_ids)
 
@@ -953,7 +959,6 @@ def main() -> int:
     )
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--show-ids", action="store_true", help="Draw candidate ids on group masks for debugging.")
-    parser.add_argument("--accept-single-mixed", action="store_true", help="Treat a single-candidate mixed leaf as wall.")
     parser.add_argument("--prepare-only", action="store_true", help="Write inventory/overlay/prompt without calling VLM.")
     parser.add_argument("--mock-response", type=Path, default=None, help="Use a saved VLM JSON response instead of calling VLM.")
     parser.add_argument("--dump-request", action="store_true")
