@@ -7,14 +7,19 @@ import argparse
 import base64
 import json
 import os
+import http.client
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRIES = 5
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -218,15 +223,28 @@ class VlmClient:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=180) as response:
-                response_text = response.read().decode("utf-8", errors="replace")
-                status = response.status
-        except urllib.error.HTTPError as error:
-            status = error.code
-            response_text = error.read().decode("utf-8", errors="replace")
-        except urllib.error.URLError as error:
-            raise RuntimeError(f"LLM request failed: {error}") from error
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    response_text = response.read().decode("utf-8", errors="replace")
+                    status = response.status
+            except urllib.error.HTTPError as error:
+                status = error.code
+                response_text = error.read().decode("utf-8", errors="replace")
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+                # Network/timeout/connection drop: retry with backoff, raise after the last attempt.
+                if attempt < MAX_RETRIES:
+                    print(f"LLM request error ({error!r}); retry {attempt + 1}/{MAX_RETRIES}", file=sys.stderr)
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"LLM request failed: {error}") from error
+
+            if status in TRANSIENT_STATUS and attempt < MAX_RETRIES:
+                wait = 2 ** attempt
+                print(f"LLM HTTP {status}; retry {attempt + 1}/{MAX_RETRIES} in {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            break
 
         try:
             data: Any = json.loads(response_text)

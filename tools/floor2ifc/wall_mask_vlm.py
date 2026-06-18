@@ -125,8 +125,10 @@ def is_wallish_candidate(element: dict[str, Any]) -> bool:
         return True
     if fill == "black" and area >= 180:
         return True
-    if has_colored_fill(element):
-        return False
+    if has_colored_fill(element) and area >= 180:
+        # Colour-mode traces render walls in their true (often grey) colour;
+        # admit substantial coloured objects and let the VLM judge each.
+        return True
     if stroke == "black" and stroke_width <= 2 and (length >= 24 or area >= 400):
         return True
     if fill in {"black", "default"} and length >= 24 and (aspect >= 2.5 or thickness <= 28):
@@ -156,6 +158,18 @@ def select_candidates(inventory: dict[str, Any], max_candidates: int) -> list[di
     return sorted(elements, key=score, reverse=True)[:max_candidates]
 
 
+def coarse_color_key(value: Any) -> str:
+    """Quantise a fill colour into a coarse bucket so near-identical colours group together."""
+    text = norm(value)
+    match = re.fullmatch(r"#([0-9a-f]{6})", text)
+    if not match:
+        return text or "none"
+    digits = match.group(1)
+    r, g, b = (int(digits[i : i + 2], 16) for i in (0, 2, 4))
+    q = lambda v: v // 48  # ~6 levels per channel
+    return f"{q(r)}{q(g)}{q(b)}"
+
+
 def visual_kind(element: dict[str, Any]) -> str:
     style = element.get("style", {})
     fill = color_token(style.get("fill"), "default")
@@ -167,7 +181,7 @@ def visual_kind(element: dict[str, Any]) -> str:
     if stroke == "black":
         return "black_stroke"
     if has_colored_fill(element):
-        return "colored_fill"
+        return f"colored_{coarse_color_key(style.get('fill'))}"
     return "other"
 
 
@@ -922,9 +936,9 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--env-file-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--image-size", type=int, default=1800)
-    parser.add_argument("--max-candidates", type=int, default=220)
-    parser.add_argument("--max-group-size", type=int, default=45)
-    parser.add_argument("--max-split-depth", type=int, default=5)
+    parser.add_argument("--max-candidates", type=int, default=500)
+    parser.add_argument("--max-group-size", type=int, default=90)
+    parser.add_argument("--max-split-depth", type=int, default=2)
     parser.add_argument(
         "--max-terminal-none-size",
         type=int,
