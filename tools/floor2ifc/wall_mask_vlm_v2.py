@@ -18,6 +18,8 @@ from svg_inventory import build_inventory
 from vlm_client import REPO_ROOT, VlmClient
 from wall_mask_vlm import (
     build_group_prompt,
+    candidate_summary,
+    compact_style_summary,
     group_candidates,
     group_with_candidates,
     parse_vlm_json,
@@ -60,29 +62,169 @@ def load_candidate_report(path: Path) -> dict[str, Any]:
     return data
 
 
+_PRESERVED_KEYS = ("mask_pixels", "mask_bbox_ratio", "selection_reason", "case", "a_object_in_mask", "b_maskblob_in_object")
+
+
+def resolve_rows(rows: Any, inventory_by_id: dict[str, Any]) -> list[dict[str, Any]]:
+    """Map report rows (id + metadata) onto fresh SVG-inventory geometry."""
+    resolved: list[dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return resolved
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or item_id not in inventory_by_id:
+            continue
+        merged = dict(inventory_by_id[item_id])
+        for key in _PRESERVED_KEYS:
+            if key in item:
+                merged[key] = item[key]
+        resolved.append(merged)
+    return resolved
+
+
+def make_group(group_id: str, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "group_id": group_id,
+        "base_group_id": group_id,
+        "depth": 0,
+        "candidate_count": len(candidates),
+        "candidate_ids": [item["id"] for item in candidates],
+        "candidates": candidates,
+    }
+
+
 def candidates_from_report(report: dict[str, Any], inventory: dict[str, Any]) -> list[dict[str, Any]]:
     inventory_by_id = {item["id"]: item for item in inventory["elements"]}
-    kept = report.get("kept")
-    if isinstance(kept, list) and kept:
-        candidates: list[dict[str, Any]] = []
-        for item in kept:
-            if not isinstance(item, dict):
-                continue
-            item_id = item.get("id")
-            if not isinstance(item_id, str) or item_id not in inventory_by_id:
-                continue
-            # Use fresh geometry/style from the SVG inventory, and preserve mask
-            # filter metadata for reports/debugging.
-            merged = dict(inventory_by_id[item_id])
-            for key in ("mask_pixels", "mask_bbox_ratio", "selection_reason"):
-                if key in item:
-                    merged[key] = item[key]
-            candidates.append(merged)
-        if candidates:
-            return candidates
+    candidates = resolve_rows(report.get("kept"), inventory_by_id)
+    if candidates:
+        return candidates
 
     kept_ids = {item for item in report.get("kept_ids", []) if isinstance(item, str)}
     return [item for item in inventory["elements"] if item["id"] in kept_ids]
+
+
+def build_case1_verify_prompt(inventory: dict[str, Any], group: dict[str, Any]) -> str:
+    summary = {
+        "source_svg": inventory.get("source_svg"),
+        "viewBox": inventory.get("viewBox"),
+        "group_id": group["group_id"],
+        "candidate_count": group["candidate_count"],
+        "style_summary_top": compact_style_summary(inventory),
+        "candidates": candidate_summary(group["candidates"]),
+    }
+    return f"""You are verifying candidate shapes that ALREADY lie on the structural wall mask of a floor plan (each overlaps the wall mask almost entirely). They are wall material by construction, so DEFAULT TO WALL.
+
+You will see THREE images:
+1. Original clean floor-plan image.
+2. Isolated candidate mask image (magenta) on a white background.
+3. The same candidates overlaid on the floor plan with candidate ids.
+
+Task:
+- These candidates sit on the structural wall. Treat EVERY candidate as a wall unless you are confident it is not.
+- Walls include exterior/interior walls, wall outlines, room-dividing boundaries, WINDOWS set into a wall, door-opening wall lines, door jambs, and short wall stubs. All of these are walls — keep them.
+- A thin line or short bar sitting in the wall at a door opening is a door-opening wall line / jamb, NOT a door leaf. Keep it as wall. Do NOT reject it as a door leaf/panel.
+- ONLY mark a candidate as non-wall if it is clearly a free-standing non-structural mark that merely happens to overlap a thick wall: a furniture/fixture icon, a text label, a dimension number/arrow, a logo, or decorative detail. When in doubt, it is a wall.
+
+Output rules:
+- Return ONLY one minified JSON object. No markdown, no code fence, no prose.
+
+JSON shape:
+{{
+  "group_id": "{group['group_id']}",
+  "verdict": "all_wall|none_wall|mixed",
+  "wall_ids": [],
+  "non_wall_ids": [],
+  "reason": "short visual reason",
+  "confidence": 0.0
+}}
+
+Verdict rules:
+- all_wall: every candidate is wall (this is the expected default here).
+- mixed: only if some candidate is a clearly non-structural free-standing mark. Put those in non_wall_ids and ALL other ids in wall_ids. Every candidate id MUST appear in exactly one of wall_ids or non_wall_ids.
+- none_wall: only if NONE are walls (very unlikely for this set).
+- Use only ids shown in image 3 and listed in the candidate summary.
+"""
+
+
+def verify_case1(
+    auto_candidates: list[dict[str, Any]],
+    svg_path: Path,
+    inventory: dict[str, Any],
+    groups_dir: Path,
+    client: VlmClient | None,
+    args: argparse.Namespace,
+    mock_review: dict[str, Any] | None,
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    """One VLM call over all case-1 auto-walls.
+
+    all_wall -> confirm every case-1 object as wall.
+    mixed    -> wall_ids and unclassified ids confirmed as wall; non_wall_ids
+                are pushed back into the candidate pool for the normal pipeline.
+    none_wall-> push the whole batch back into the candidate pool.
+    """
+    group = make_group("case1_auto_wall_verify", auto_candidates)
+    group_dir = groups_dir / group["group_id"]
+    group_dir.mkdir(parents=True, exist_ok=True)
+    mask_svg = group_dir / "candidate_mask.svg"
+    overlay_svg = group_dir / "candidate_overlay.svg"
+    prompt_path = group_dir / "wall_label_prompt.txt"
+    raw_path = group_dir / "vlm_raw.txt"
+    review_out = group_dir / "vlm_wall_labels.json"
+
+    render_group_mask(svg_path, group, mask_svg, args.show_ids)
+    render_group_overlay(svg_path, group, overlay_svg)
+    prompt = build_case1_verify_prompt(inventory, group)
+    prompt_path.write_text(prompt, encoding="utf-8")
+
+    review: dict[str, Any] = {
+        "group_id": group["group_id"],
+        "verdict": "mixed" if args.prepare_only else "all_wall",
+        "reason": "prepare_only" if args.prepare_only else "",
+        "confidence": 0,
+    }
+    if mock_review is not None:
+        review = {**review, **mock_review, "group_id": group["group_id"]}
+        raw_path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
+    elif not args.prepare_only and client is not None:
+        raw = client.chat_with_svgs(
+            prompt,
+            [svg_path, mask_svg, overlay_svg],
+            image_size=args.image_size,
+            dump_request=args.dump_request,
+            max_tokens=args.max_output_tokens,
+        )
+        raw_path.write_text(raw, encoding="utf-8")
+        try:
+            review = parse_vlm_json(raw, raw_path)
+        except ValueError:
+            repaired = repair_vlm_json(client, raw, args.dump_request, args.max_output_tokens)
+            repair_path = group_dir / "vlm_repair_raw.txt"
+            repair_path.write_text(repaired, encoding="utf-8")
+            review = parse_vlm_json(repaired, repair_path)
+
+    verdict = str(review.get("verdict") or "").strip().lower()
+    if verdict not in {"all_wall", "none_wall", "mixed"}:
+        verdict = "mixed"
+
+    non_wall_ids = review_candidate_ids(review, "non_wall_ids", group)
+    if verdict == "none_wall":
+        confirmed_ids: list[str] = []
+        pushed_back = list(auto_candidates)
+    else:  # all_wall, or mixed (wall + unclassified -> wall)
+        confirmed_ids = [item["id"] for item in auto_candidates if item["id"] not in non_wall_ids]
+        pushed_back = [item for item in auto_candidates if item["id"] in non_wall_ids]
+
+    write_json(review_out, review)
+    meta = {
+        "verdict": verdict,
+        "auto_wall_count": len(auto_candidates),
+        "confirmed_count": len(confirmed_ids),
+        "pushed_back_count": len(pushed_back),
+        "vlm_wall_labels": str(review_out),
+    }
+    return confirmed_ids, pushed_back, meta
 
 
 def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -98,8 +240,9 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
 
     out_dir.mkdir(parents=True, exist_ok=True)
     inventory = build_inventory(svg_path)
+    inventory_by_id = {item["id"]: item for item in inventory["elements"]}
     candidates = candidates_from_report(report, inventory)[: args.max_candidates]
-    initial_groups = group_candidates(candidates, args.max_group_size)
+    auto_candidates = resolve_rows(report.get("auto_wall"), inventory_by_id)
 
     inventory_path = out_dir / "inventory.json"
     candidates_path = out_dir / "candidates.json"
@@ -111,6 +254,22 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
     overlay_path = out_dir / "wall_mask_overlay.svg"
     manifest_path = out_dir / "result.json"
 
+    groups_dir.mkdir(parents=True, exist_ok=True)
+    client = None if args.prepare_only or args.mock_response else VlmClient(args.env_file_root)
+    mock_review = json.loads(args.mock_response.read_text(encoding="utf-8")) if args.mock_response else None
+
+    # Verify case-1 auto-walls in a single VLM call; confirmed ones skip the
+    # pipeline, rejected ones rejoin case-2/case-3 as ordinary candidates.
+    case1_confirmed_ids: list[str] = []
+    case1_meta: dict[str, Any] = {"verdict": None, "auto_wall_count": len(auto_candidates), "confirmed_count": 0, "pushed_back_count": 0}
+    if auto_candidates:
+        case1_confirmed_ids, pushed_back, case1_meta = verify_case1(
+            auto_candidates, svg_path, inventory, groups_dir, client, args, mock_review
+        )
+        candidates = candidates + pushed_back
+
+    initial_groups = group_candidates(candidates, args.max_group_size)
+
     write_json(inventory_path, inventory)
     write_json(
         candidates_path,
@@ -120,6 +279,8 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
             "source_png": report.get("png"),
             "semantic_filter_mask": report.get("semantic_filter_mask"),
             "input_candidate_count": report.get("kept_count", len(candidates)),
+            "candidate_count": len(candidates),
+            "case1_verification": case1_meta,
             "candidates": candidates,
         },
     )
@@ -143,16 +304,10 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
     )
     render_candidate_overlay(svg_path, candidates, candidate_overlay_path)
 
-    groups_dir.mkdir(parents=True, exist_ok=True)
-    client = None if args.prepare_only or args.mock_response else VlmClient(args.env_file_root)
     group_reviews: list[dict[str, Any]] = []
     selected_id_set: set[str] = set()
     queue = list(initial_groups)
     processed_count = 0
-
-    mock_review = None
-    if args.mock_response:
-        mock_review = json.loads(args.mock_response.read_text(encoding="utf-8"))
 
     while queue:
         group = queue.pop(0)
@@ -275,7 +430,9 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
             }
         )
 
-    selected_ids = sorted(selected_id_set)
+    vlm_selected_ids = sorted(selected_id_set)
+    # Final walls = pipeline-selected (case-2/3 + pushed-back case-1) U confirmed case-1.
+    selected_ids = sorted(set(vlm_selected_ids) | set(case1_confirmed_ids))
     write_json(
         review_path,
         {
@@ -283,12 +440,17 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
             "candidate_report": report["_candidate_report_path"],
             "initial_group_count": len(initial_groups),
             "processed_group_count": processed_count,
+            "vlm_selected_count": len(vlm_selected_ids),
+            "vlm_selected_wall_ids": vlm_selected_ids,
+            "case1_verification": case1_meta,
+            "case1_confirmed_count": len(case1_confirmed_ids),
+            "case1_confirmed_ids": sorted(case1_confirmed_ids),
             "selected_wall_count": len(selected_ids),
             "selected_wall_ids": selected_ids,
             "groups": group_reviews,
         },
     )
-    render_mask_svgs(svg_path, selected_ids, candidates, overlay_path, mask_path)
+    render_mask_svgs(svg_path, selected_ids, candidates + auto_candidates, overlay_path, mask_path)
 
     manifest = {
         "source_svg": str(svg_path),
@@ -300,6 +462,10 @@ def run_candidate_report(report_path: Path, out_dir: Path, args: argparse.Namesp
         "input_candidate_count": report.get("kept_count"),
         "initial_group_count": len(initial_groups),
         "processed_group_count": processed_count,
+        "vlm_selected_count": len(vlm_selected_ids),
+        "case1_verdict": case1_meta.get("verdict"),
+        "case1_confirmed_count": len(case1_confirmed_ids),
+        "case1_pushed_back_count": case1_meta.get("pushed_back_count", 0),
         "selected_wall_count": len(selected_ids),
         "selected_wall_ids": selected_ids,
         "inventory": str(inventory_path),

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import tempfile
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -17,9 +18,20 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from scipy import ndimage
 
-from svg_inventory import GEOMETRY_TAGS, build_inventory, element_bounds, local_name, parse_float, points_for
+from svg_inventory import (
+    GEOMETRY_TAGS,
+    build_inventory,
+    element_bounds,
+    local_name,
+    parse_float,
+    points_for,
+    rough_path_points,
+    transform_points,
+)
 
 
 DEFAULT_OUT_DIR = Path(__file__).parent / "out/png-mask-svg-candidates"
@@ -123,6 +135,23 @@ def element_points(elem: ET.Element, element: dict[str, Any], offset: tuple[int,
     return [(x - ox, y - oy) for x, y in points_for(elem, bounds)]
 
 
+def path_subpaths(elem: ET.Element, offset: tuple[int, int]) -> list[list[tuple[float, float]]]:
+    """Per-subpath point lists for a path (vtracer emits absolute coords)."""
+    d_attr = elem.attrib.get("d")
+    if not d_attr:
+        return []
+    transform = elem.attrib.get("transform")
+    ox, oy = offset
+    out: list[list[tuple[float, float]]] = []
+    for chunk in re.split(r"(?=[Mm])", d_attr):
+        if not chunk.strip():
+            continue
+        points = transform_points(rough_path_points(chunk), transform)
+        if points:
+            out.append([(x - ox, y - oy) for x, y in points])
+    return out
+
+
 def element_mask(elem: ET.Element, element: dict[str, Any], image_size: tuple[int, int]) -> tuple[Image.Image, tuple[int, int, int, int]] | None:
     box = bbox_pixels(element.get("bbox", {}), image_size)
     if box is None:
@@ -169,57 +198,86 @@ def element_mask(elem: ET.Element, element: dict[str, Any], image_size: tuple[in
     elif tag == "path" and len(points) >= 2:
         if stroke_only:
             draw.line(points, fill=255, width=stroke_width, joint="curve")
-        elif len(points) >= 3:
-            draw.polygon(points, fill=255)
         else:
-            draw.line(points, fill=255, width=stroke_width)
+            # Fill each subpath separately with even-odd (XOR) so disconnected
+            # subpaths are not bridged into one polygon and holes are preserved.
+            rings = [sp for sp in path_subpaths(elem, (left, top)) if len(sp) >= 3]
+            if rings:
+                acc = np.zeros((bottom - top, right - left), dtype=bool)
+                for ring in rings:
+                    tmp = Image.new("L", (right - left, bottom - top), 0)
+                    ImageDraw.Draw(tmp).polygon(ring, fill=255)
+                    acc ^= np.asarray(tmp) > 0
+                mask = Image.fromarray((acc.astype("uint8") * 255), mode="L")
+            elif len(points) >= 2:
+                draw.line(points, fill=255, width=stroke_width)
 
     return mask, box
+
+
+_EMPTY_STATS = {"overlap_pixels": 0, "element_pixels": 0, "a_object_in_mask": 0.0, "b_maskblob_in_object": 0.0}
 
 
 def mask_stats_for_element(
     elem: ET.Element | None,
     element: dict[str, Any],
     semantic_mask: Image.Image,
+    labels: np.ndarray,
+    comp_sizes: np.ndarray,
 ) -> dict[str, Any]:
+    """Two containment ratios from a rasterised element footprint.
+
+    A = overlap / element_pixels        (how much of the OBJECT is on the mask)
+    B = max over mask components of      (does the object swallow a whole
+          covered / component_pixels      connected mask blob?)
+    """
     if elem is None:
-        return {"overlap_pixels": 0, "element_pixels": 0, "element_overlap": 0.0}
+        return dict(_EMPTY_STATS)
     rendered = element_mask(elem, element, semantic_mask.size)
     if rendered is None:
-        return {"overlap_pixels": 0, "element_pixels": 0, "element_overlap": 0.0}
+        return dict(_EMPTY_STATS)
 
-    element_image, box = rendered
-    semantic_crop = semantic_mask.crop(box)
-    overlap_image = ImageChops.multiply(element_image, semantic_crop)
-    element_pixels = sum(element_image.histogram()[1:])
-    overlap_pixels = sum(overlap_image.histogram()[1:])
+    element_image, (left, top, right, bottom) = rendered
+    elem_arr = np.asarray(element_image) > 0
+    element_pixels = int(elem_arr.sum())
+    if element_pixels == 0:
+        return dict(_EMPTY_STATS)
+
+    label_crop = labels[top:bottom, left:right]
+    overlap_pixels = int((elem_arr & (label_crop > 0)).sum())
+
+    b_ratio = 0.0
+    for comp in np.unique(label_crop[elem_arr]):
+        if comp == 0:
+            continue
+        covered = int(((label_crop == comp) & elem_arr).sum())
+        total = int(comp_sizes[comp])
+        if total > 0:
+            b_ratio = max(b_ratio, covered / total)
+
     return {
         "overlap_pixels": overlap_pixels,
         "element_pixels": element_pixels,
-        "element_overlap": overlap_pixels / max(element_pixels, 1),
+        "a_object_in_mask": overlap_pixels / element_pixels,
+        "b_maskblob_in_object": b_ratio,
     }
 
 
-def keep_element(element: dict[str, Any], stats: dict[str, Any], args: argparse.Namespace) -> tuple[bool, str]:
+def classify_element(element: dict[str, Any], stats: dict[str, Any], args: argparse.Namespace) -> tuple[str, int, str]:
+    """Return (bucket, case, reason). bucket in {auto_wall, candidate, drop}."""
     area = float(element.get("area") or 0)
-    width = float(element.get("width") or 0)
-    height = float(element.get("height") or 0)
-    thickness = min(width, height)
-    aspect = float(element.get("aspect_ratio") or 0)
-    overlap_pixels = int(stats["overlap_pixels"])
-    ratio = float(stats["element_overlap"])
+    a_ratio = float(stats["a_object_in_mask"])
+    b_ratio = float(stats["b_maskblob_in_object"])
 
     if area < args.min_area:
-        return False, "small_area"
-    if overlap_pixels < args.min_overlap_pixels:
-        return False, "low_overlap_pixels"
-    if ratio >= args.min_element_overlap:
-        return True, "element_overlap"
-    if aspect >= args.thin_aspect and thickness <= args.thin_max_thickness and overlap_pixels >= args.thin_min_overlap_pixels:
-        return True, "thin_mask_hit"
-    if overlap_pixels >= args.large_overlap_pixels and ratio >= args.large_min_element_overlap:
-        return True, "large_mask_hit"
-    return False, "low_element_overlap"
+        return "drop", 0, "small_area"
+    if a_ratio >= args.a_full:
+        return "auto_wall", 1, "case1_object_in_mask"
+    if b_ratio >= args.b_full:
+        return "candidate", 2, "case2_maskblob_in_object"
+    if a_ratio >= args.a_min:
+        return "candidate", 3, "case3_straddler"
+    return "drop", 3, "case3_low_overlap"
 
 
 def index_source_elements(svg_path: Path) -> tuple[ET.Element, dict[str, ET.Element]]:
@@ -362,26 +420,34 @@ def run(png_path: Path, mask_path: Path, out_dir: Path, args: argparse.Namespace
         with tempfile.TemporaryDirectory(prefix="floor2ifc-mask-svg-") as tmp:
             convert(png_path, svg_path, False, args.filter_speckle, args.color_precision, Path(tmp))
 
+    labels, _ = ndimage.label(np.asarray(semantic_mask) > 0)
+    comp_sizes = np.bincount(labels.ravel())
+
     inventory = build_inventory(svg_path)
     _root, by_id = index_source_elements(svg_path)
+    auto_wall: list[dict[str, Any]] = []
     kept: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     reason_counts: dict[str, int] = {}
 
     for element in inventory["elements"]:
-        stats = mask_stats_for_element(by_id.get(element["id"]), element, semantic_mask)
-        keep, reason = keep_element(element, stats, args)
+        stats = mask_stats_for_element(by_id.get(element["id"]), element, semantic_mask, labels, comp_sizes)
+        bucket, case, reason = classify_element(element, stats, args)
         row = {
             **element,
             "overlap_pixels": stats["overlap_pixels"],
             "element_pixels": stats["element_pixels"],
-            "element_overlap": round(float(stats["element_overlap"]), 6),
+            "a_object_in_mask": round(float(stats["a_object_in_mask"]), 6),
+            "b_maskblob_in_object": round(float(stats["b_maskblob_in_object"]), 6),
+            "case": case,
             "selection_reason": reason,
         }
-        if keep:
+        if bucket == "auto_wall":
+            auto_wall.append(row)
+        elif bucket == "candidate":
             kept.append(row)
         else:
-            rejected.append({"id": element["id"], "reason": reason, **stats})
+            rejected.append({"id": element["id"], "case": case, "reason": reason, **stats})
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
     overlay_path, kept_mask_path = render_outputs(svg_path, kept, out_dir, args.overlay_opacity, args.show_ids)
@@ -392,6 +458,7 @@ def run(png_path: Path, mask_path: Path, out_dir: Path, args: argparse.Namespace
         "semantic_filter_mask": str(semantic_mask_path),
         "generated_svg": str(svg_path),
         "element_count": inventory["element_count"],
+        "auto_wall_count": len(auto_wall),
         "kept_count": len(kept),
         "rejected_count": len(rejected),
         "rejected_by_reason": dict(sorted(reason_counts.items())),
@@ -401,6 +468,8 @@ def run(png_path: Path, mask_path: Path, out_dir: Path, args: argparse.Namespace
             for key, value in vars(args).items()
             if key not in {"png", "mask", "out_dir", "classes"}
         },
+        "auto_wall_ids": [item["id"] for item in auto_wall],
+        "auto_wall": auto_wall,
         "kept_ids": [item["id"] for item in kept],
         "kept": kept,
         "rejected": rejected,
@@ -420,14 +489,10 @@ def main() -> int:
     parser.add_argument("--svg", type=Path, default=None, help="Use an existing png2svg output instead of tracing the PNG.")
     parser.add_argument("--classes", nargs="+", default=list(DEFAULT_CLASSES), help="Semantic room classes to use as filter mask.")
     parser.add_argument("--mask-dilate", type=int, default=1, help="Dilate semantic mask by this many pixels before overlap.")
-    parser.add_argument("--min-area", type=float, default=80)
-    parser.add_argument("--min-overlap-pixels", type=int, default=6)
-    parser.add_argument("--min-element-overlap", type=float, default=0.08)
-    parser.add_argument("--thin-aspect", type=float, default=5.0)
-    parser.add_argument("--thin-max-thickness", type=float, default=18)
-    parser.add_argument("--thin-min-overlap-pixels", type=int, default=3)
-    parser.add_argument("--large-overlap-pixels", type=int, default=120)
-    parser.add_argument("--large-min-element-overlap", type=float, default=0.02)
+    parser.add_argument("--min-area", type=float, default=80, help="Drop objects with bbox area below this before classifying.")
+    parser.add_argument("--a-full", type=float, default=0.9, help="case 1: A>=a_full -> auto-wall (skips VLM).")
+    parser.add_argument("--b-full", type=float, default=0.9, help="case 2: B>=b_full -> candidate (a whole mask blob inside object).")
+    parser.add_argument("--a-min", type=float, default=0.3, help="case 3: keep as candidate if A>=a_min, else drop.")
     parser.add_argument("--filter-speckle", type=int, default=4)
     parser.add_argument("--color-precision", type=int, default=6)
     parser.add_argument("--overlay-opacity", type=float, default=0.42)
@@ -447,7 +512,8 @@ def main() -> int:
     out_dir = args.out_dir / args.png.stem
     manifest = run(args.png, args.mask, out_dir, args)
     print(f"elements: {manifest['element_count']}")
-    print(f"kept: {manifest['kept_count']}")
+    print(f"auto_wall (case1, skip VLM): {manifest['auto_wall_count']}")
+    print(f"candidates (case2 + case3>=a_min): {manifest['kept_count']}")
     print(f"rejected: {manifest['rejected_count']}")
     print("rejected by reason:")
     for reason, count in manifest["rejected_by_reason"].items():
