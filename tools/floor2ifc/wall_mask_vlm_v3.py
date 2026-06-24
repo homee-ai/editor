@@ -105,6 +105,72 @@ def spatial_batches(objects: list[dict[str, Any]], batch_size: int) -> list[list
     return [ordered[i : i + batch_size] for i in range(0, len(ordered), batch_size)]
 
 
+def hex_to_rgb(value: Any) -> tuple[int, int, int] | None:
+    text = str(value or "").strip()
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", text)
+    if m:
+        h = m.group(1)
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    m = re.fullmatch(r"#?([0-9a-fA-F]{3})", text)
+    if m:
+        h = m.group(1)
+        return int(h[0] * 2, 16), int(h[1] * 2, 16), int(h[2] * 2, 16)
+    return None
+
+
+def representative_rgb(obj: dict[str, Any]) -> tuple[int, int, int]:
+    style = obj.get("style", {})
+    for key in ("fill", "stroke"):
+        value = style.get(key)
+        if value and str(value).strip().lower() not in ("none", "transparent", ""):
+            rgb = hex_to_rgb(value)
+            if rgb is not None:
+                return rgb
+    return (0, 0, 0)
+
+
+def cluster_fills(objects: list[dict[str, Any]], num_colors: int) -> dict[str, int]:
+    """id -> palette index, grouping objects with similar SVG fill RGB.
+
+    Agglomerative: start each object its own cluster, merge the two closest
+    (RGB Euclidean) until <= num_colors remain. Palette indices ordered by
+    luminance for stable output.
+    """
+    n = len(objects)
+    if n <= num_colors:
+        return {obj["id"]: i for i, obj in enumerate(objects)}
+
+    # cluster = [centroid(list rgb), count, member object-indices]
+    clusters = [[list(representative_rgb(obj)), 1, [i]] for i, obj in enumerate(objects)]
+
+    def distance(a: list[float], b: list[float]) -> float:
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+    while len(clusters) > num_colors:
+        best = None
+        pair = (0, 1)
+        for a in range(len(clusters)):
+            for b in range(a + 1, len(clusters)):
+                d = distance(clusters[a][0], clusters[b][0])
+                if best is None or d < best:
+                    best = d
+                    pair = (a, b)
+        a, b = pair
+        ca, cb = clusters[a], clusters[b]
+        total = ca[1] + cb[1]
+        centroid = [(ca[0][k] * ca[1] + cb[0][k] * cb[1]) / total for k in range(3)]
+        merged = [centroid, total, ca[2] + cb[2]]
+        clusters = [clusters[i] for i in range(len(clusters)) if i not in (a, b)]
+        clusters.append(merged)
+
+    clusters.sort(key=lambda c: 0.299 * c[0][0] + 0.587 * c[0][1] + 0.114 * c[0][2])
+    idx_map: dict[str, int] = {}
+    for color_index, cluster in enumerate(clusters):
+        for member in cluster[2]:
+            idx_map[objects[member]["id"]] = color_index
+    return idx_map
+
+
 # --------------------------------------------------------------------------- #
 # Rendering (colour fill, no id text)
 # --------------------------------------------------------------------------- #
@@ -249,19 +315,27 @@ def process_stream(
         return selected, logs
 
     num_colors = min(args.max_colors, len(PALETTE))
+
+    def cap_for(depth: int) -> int:
+        return args.l0_batch_size if depth == 0 else args.batch_size
+
     queue: deque[tuple[list[dict[str, Any]], int]] = deque(
-        (batch, 0) for batch in spatial_batches(objects, args.batch_size)
+        (batch, 0) for batch in spatial_batches(objects, cap_for(0))
     )
 
     while queue:
         group, depth = queue.popleft()
         if not group:
             continue
-        if len(group) > args.batch_size:
-            queue.extendleft((batch, depth) for batch in reversed(spatial_batches(group, args.batch_size)))
+        if len(group) > cap_for(depth):
+            queue.extendleft((batch, depth) for batch in reversed(spatial_batches(group, cap_for(depth))))
             continue
 
-        idx_map = assign_colors(group, num_colors, args.adjacency_px)
+        # Level 0: group by SVG-fill RGB similarity. Deeper: adjacency-distinct.
+        if depth == 0:
+            idx_map = cluster_fills(group, num_colors)
+        else:
+            idx_map = assign_colors(group, num_colors, args.adjacency_px)
         color_to_ids: dict[str, list[str]] = {}
         for oid, idx in idx_map.items():
             color_to_ids.setdefault(PALETTE[idx][0], []).append(oid)
@@ -427,9 +501,10 @@ def main() -> int:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--env-file-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--image-size", type=int, default=1800)
-    parser.add_argument("--batch-size", type=int, default=32, help="Max candidates per image.")
+    parser.add_argument("--l0-batch-size", type=int, default=64, help="Max candidates per image at level 0 (RGB-clustered).")
+    parser.add_argument("--batch-size", type=int, default=32, help="Max candidates per image at deeper levels (adjacency-coloured).")
     parser.add_argument("--max-colors", type=int, default=8, help="Colours per image (<= palette size).")
-    parser.add_argument("--adjacency-px", type=float, default=24.0, help="bbox gap under which two objects are adjacent.")
+    parser.add_argument("--adjacency-px", type=float, default=24.0, help="bbox gap under which two objects are adjacent (deeper levels).")
     parser.add_argument("--max-depth", type=int, default=4, help="Max recolour-recursion depth before keeping mixed as wall.")
     parser.add_argument("--prepare-only", action="store_true", help="Render first-round images/prompts, no VLM calls.")
     parser.add_argument("--dump-request", action="store_true")

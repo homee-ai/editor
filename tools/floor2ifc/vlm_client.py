@@ -170,7 +170,15 @@ class VlmClient:
             or ""
         )
         self.temperature = float(self.env.get("EDITOR_LLM_TEMPERATURE", "0.2"))
-        self.max_tokens = max(int(self.env.get("EDITOR_LLM_MAX_TOKENS", "4096")), 4096)
+        # OpenAI reasoning models (gpt-5*, o1/o3/o4*) need max_completion_tokens,
+        # reject a custom temperature, and spend tokens on reasoning, so give them
+        # a higher floor so the (small) JSON reply is not starved.
+        self.is_reasoning = bool(re.match(r"^(gpt-5|o[1-9])", self.model.strip().lower()))
+        token_floor = 16000 if self.is_reasoning else 4096
+        self.max_tokens = max(int(self.env.get("EDITOR_LLM_MAX_TOKENS", str(token_floor))), token_floor)
+        # Reasoning models at high effort often take minutes per call; the read
+        # timeout must be generous or every call times out and retries forever.
+        self.timeout = int(self.env.get("EDITOR_LLM_TIMEOUT", "600" if self.is_reasoning else "120"))
         self.reasoning_effort = normalize_reasoning_effort(
             self.env.get("EDITOR_LLM_REASONING_EFFORT")
         )
@@ -187,10 +195,14 @@ class VlmClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": build_messages(prompt, image_urls),
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
             "stream": False,
         }
+        if self.is_reasoning:
+            # reasoning models: max_completion_tokens, no custom temperature.
+            payload["max_completion_tokens"] = self.max_tokens
+        else:
+            payload["max_tokens"] = self.max_tokens
+            payload["temperature"] = self.temperature
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
 
@@ -225,7 +237,7 @@ class VlmClient:
         )
         for attempt in range(MAX_RETRIES + 1):
             try:
-                with urllib.request.urlopen(request, timeout=60) as response:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     response_text = response.read().decode("utf-8", errors="replace")
                     status = response.status
             except urllib.error.HTTPError as error:
