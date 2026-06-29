@@ -62,6 +62,62 @@ export function CreateSceneButton({ label = 'Create new scene' }: { label?: stri
 }
 
 /**
+ * Uploads a floor-plan PNG, runs the CubiCasa + wall-extraction pipeline on the
+ * server, and navigates to the generated scene. The pipeline takes a few minutes.
+ */
+export function FloorplanUploadButton({ label = 'Upload floor plan' }: { label?: string } = {}) {
+  const router = useRouter()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleFile = useCallback(
+    async (file: File) => {
+      setBusy(true)
+      setError(null)
+      try {
+        const body = new FormData()
+        body.append('file', file)
+        const response = await fetch('/api/floorplan', { method: 'POST', body })
+        if (!response.ok) {
+          const detail = await response.json().catch(() => null)
+          setError(detail?.message ?? `Failed (${response.status})`)
+          return
+        }
+        const meta = (await response.json()) as { id: string }
+        router.push(`/scene/${meta.id}`)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Upload failed')
+      } finally {
+        setBusy(false)
+      }
+    },
+    [router],
+  )
+
+  return (
+    <div className="flex items-center gap-3">
+      {error && <span className="text-destructive text-xs">{error}</span>}
+      <label
+        className={`cursor-pointer rounded-md border border-border bg-accent px-3 py-1.5 font-medium text-sm hover:bg-accent/80 ${busy ? 'pointer-events-none opacity-50' : ''}`}
+      >
+        {busy ? 'Processing… (a few min)' : label}
+        <input
+          accept="image/png,image/jpeg"
+          className="hidden"
+          disabled={busy}
+          onChange={(e) => {
+            const f = e.target.files?.[0]
+            e.target.value = ''
+            if (f) void handleFile(f)
+          }}
+          type="file"
+        />
+      </label>
+    </div>
+  )
+}
+
+/**
  * Save + Save-as buttons that call the scenes API directly.
  * Used for UIs that want explicit save controls outside of the Editor's
  * built-in autosave plumbing.

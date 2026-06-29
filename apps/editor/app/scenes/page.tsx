@@ -1,6 +1,6 @@
 import { headers } from 'next/headers'
 import Link from 'next/link'
-import { CreateSceneButton } from '@/components/save-button'
+import { CreateSceneButton, FloorplanUploadButton } from '@/components/save-button'
 import type { SceneMeta } from '@/components/scene-loader'
 
 export const dynamic = 'force-dynamic'
@@ -58,7 +58,10 @@ export default async function ScenesPage() {
             <span className="text-muted-foreground">/</span>
             <span className="font-medium text-foreground">Scenes</span>
           </nav>
-          <CreateSceneButton />
+          <div className="flex items-center gap-3">
+            <FloorplanUploadButton />
+            <CreateSceneButton />
+          </div>
         </div>
       </header>
 
