@@ -66,6 +66,12 @@ function validateAuth(request: Request): NextResponse | null {
   const token = process.env.PASCAL_SCENE_API_TOKEN
   if (!token) {
     if (isLoopbackRequest(request)) return null
+    // Tokenless deployments (e.g. a demo) trust requests from explicitly
+    // allow-listed origins via PASCAL_SCENE_API_ORIGINS — the same-origin browser
+    // app talking to its own API. Off by default (no env => loopback only).
+    const origin = request.headers.get('origin')
+    const parsed = origin ? parseUrl(origin) : null
+    if (parsed && configuredOrigins().has(normalizeOrigin(parsed))) return null
     return sceneApiJson(request, { error: 'scene_api_token_required' }, { status: 503 })
   }
 

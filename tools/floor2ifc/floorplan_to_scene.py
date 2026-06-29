@@ -25,8 +25,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 F2I = REPO_ROOT / "tools/floor2ifc"
 CUBI = REPO_ROOT / "tools/CubiCasa5k"
-DEFAULT_CUBI_PY = Path.home() / "miniforge3/envs/cubicasa/bin/python"
-DEFAULT_F2I_PY = Path.home() / "miniforge3/envs/floor2ifc/bin/python"
+DEFAULT_CUBI_PY = Path(os.environ.get("CUBICASA_PYTHON") or Path.home() / "miniforge3/envs/cubicasa/bin/python")
+DEFAULT_F2I_PY = Path(os.environ.get("FLOOR2IFC_PYTHON") or Path.home() / "miniforge3/envs/floor2ifc/bin/python")
 STAGES = ["cubicasa", "candidates", "vlm", "notwall", "pipeline", "scene"]
 
 

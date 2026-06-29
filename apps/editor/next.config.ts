@@ -1,6 +1,9 @@
 import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
+  // Allow the public demo host to reach dev resources (Next 15 blocks cross-origin
+  // dev access by default). Extra hosts via NEXT_ALLOWED_DEV_ORIGINS (comma-sep).
+  allowedDevOrigins: ['34.80.144.112', ...(process.env.NEXT_ALLOWED_DEV_ORIGINS?.split(',') ?? [])],
   logging: {
     browserToTerminal: true,
   },
